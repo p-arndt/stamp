@@ -284,12 +284,13 @@ type snapshot struct {
 func (p *Plan) Run() error {
 	var written []snapshot
 
-	// restore puts every written file back and reports what it restored.
+	// restore puts every written file back and reports what it restored. It is
+	// passed to fail, which prints it *after* the reason for the abort — the
+	// user wants to read why it stopped before what it undid.
 	restore := func() {
 		if len(written) == 0 {
 			return
 		}
-		ui.Blank()
 		ui.Step("Restored:")
 		for _, s := range written {
 			if err := os.WriteFile(filepath.Join(p.Repo.Root, s.path), s.data, s.mode); err != nil {
@@ -305,13 +306,10 @@ func (p *Plan) Run() error {
 			abs := filepath.Join(p.Repo.Root, src.Path())
 			data, mode, err := readWithMode(abs)
 			if err != nil {
-				restore()
-				return failure(err, "No commit created.", "No tag created.", "Nothing pushed.")
+				return fail(err, restore, notNothing...)
 			}
 			if err := src.Write(p.Next); err != nil {
-				restore()
-				return failure(fmt.Errorf("writing %s: %w", src.Path(), err),
-					"No commit created.", "No tag created.", "Nothing pushed.")
+				return fail(fmt.Errorf("writing %s: %w", src.Path(), err), restore, notNothing...)
 			}
 			written = append(written, snapshot{path: src.Path(), data: data, mode: mode})
 			ui.Step("  updated %s", src.Describe())
@@ -325,13 +323,11 @@ func (p *Plan) Run() error {
 	if !p.Unchanged {
 		changed, err := p.Repo.HasChanges(p.Config.Paths()...)
 		if err != nil {
-			restore()
-			return failure(err, "No commit created.", "No tag created.", "Nothing pushed.")
+			return fail(err, restore, notNothing...)
 		}
 		if changed {
 			if err := p.Repo.Add(p.Config.Paths()...); err != nil {
-				restore()
-				return failure(err, "No commit created.", "No tag created.", "Nothing pushed.")
+				return fail(err, restore, notNothing...)
 			}
 			if err := p.Repo.Commit(p.Commit); err != nil {
 				// Unstage before restoring, so the index does not keep a
@@ -339,8 +335,7 @@ func (p *Plan) Run() error {
 				if uerr := p.Repo.Unstage(p.Config.Paths()...); uerr != nil {
 					ui.Errorf("could not unstage: %v", uerr)
 				}
-				restore()
-				return failure(err, "No commit created.", "No tag created.", "Nothing pushed.")
+				return fail(err, restore, notNothing...)
 			}
 			committed = true
 			ui.Step("  committed %q", p.Commit)
@@ -401,12 +396,20 @@ var errAborted = errors.New("release aborted")
 // IsAborted reports whether err was already reported to the user.
 func IsAborted(err error) bool { return errors.Is(err, errAborted) }
 
-// failure reports err plus what did *not* happen, then returns errAborted.
-func failure(err error, notes ...string) error {
+// notNothing is the reassurance printed under an abort: the three things that
+// definitely did not happen.
+var notNothing = []string{"No commit created.", "No tag created.", "Nothing pushed."}
+
+// fail reports err, then what was rolled back, then what did *not* happen, and
+// returns errAborted.
+func fail(err error, restore func(), notes ...string) error {
 	ui.Blank()
 	ui.Errorf("%v", err)
 	ui.Blank()
 	ui.Step("Release aborted.")
+	if restore != nil {
+		restore()
+	}
 	for _, n := range notes {
 		ui.Note("%s", n)
 	}

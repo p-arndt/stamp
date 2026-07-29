@@ -108,6 +108,18 @@ release-dry bump="patch": build-release
     ./{{BIN}} release {{bump}} --dry-run
 
 # ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+
+# Re-record assets/demo.gif from demo/stamp.tape. Needs `vhs`
+# (brew install vhs). Nothing real is recorded: demo/setup.sh builds a throwaway
+# repository with a bare remote under $TMPDIR, so the release in the GIF is a real
+# release of an invented project.
+[unix]
+demo: build
+    DEMO_SETUP="$PWD/demo/setup.sh" PATH="$PWD:$PATH" vhs demo/stamp.tape
+
+# ---------------------------------------------------------------------------
 # Housekeeping
 # ---------------------------------------------------------------------------
 
