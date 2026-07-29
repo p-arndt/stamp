@@ -26,6 +26,11 @@ duplizierte `scripts/release.mjs` + `scripts/set-version.mjs`.
 - Optionale `.stamp.yml`; ohne Config läuft alles über Auto-Detect
 - Eigener Release-Workflow: Cross-Compile, Archive, Checksums, Changelog,
   GitHub Release — Binaries zum Download
+- Nachträglich ergänzt (2026-07-30): `stamp self-update` / `stamp check-update`
+  plus passiver Update-Hinweis auf stderr, portiert aus hop. Verteilung läuft
+  über GitHub Releases, also ist der Updater die Verteilung — ohne ihn hängt
+  jede Installation auf ihrer Version fest. `STAMP_NO_UPDATE_CHECK=1` schaltet
+  den Hinweis ab; Dev-Builds prüfen nie.
 
 ### Out of scope
 

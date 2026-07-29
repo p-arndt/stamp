@@ -607,6 +607,54 @@ func TestOutsideAGitRepository(t *testing.T) {
 	requireContains(t, string(out), "not inside a git repository")
 }
 
+// The test binary is built without -ldflags, so it reports itself as "dev".
+// Both update commands must refuse that before any network call: a source build
+// has no release to compare against, and swapping a `go build` output for a
+// release binary is never what the developer running it meant.
+func TestUpdateCommandsRefuseDevBuild(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	for _, cmd := range []string{"check-update", "self-update"} {
+		out, code := r.stamp(cmd)
+		if code == 0 {
+			t.Fatalf("stamp %s on a dev build should exit non-zero:\n%s", cmd, out)
+		}
+		requireContains(t, out, `"dev" build`)
+	}
+}
+
+// The update commands operate on the installed binary, not on a project, so they
+// must work with no repository in sight — the failure below is the dev-build
+// refusal, which proves the command ran rather than being turned away by the
+// repository lookup every other command starts with.
+func TestUpdateCommandsDoNotNeedARepository(t *testing.T) {
+	dir := t.TempDir()
+	cmd := exec.Command(stampBin, "check-update")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "NO_COLOR=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected the dev-build refusal:\n%s", out)
+	}
+	if strings.Contains(string(out), "not inside a git repository") {
+		t.Errorf("check-update must not require a repository:\n%s", out)
+	}
+	requireContains(t, string(out), `"dev" build`)
+}
+
+// A dev build must also stay silent about updates: `stamp current` is meant for
+// shell substitution, and a stray notice would be noise in every dev run.
+func TestCurrentSilentAboutUpdatesOnDevBuild(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	out := r.mustStamp("current")
+	if strings.TrimSpace(out) != "0.4.0" {
+		t.Errorf("current printed more than the version: %q", out)
+	}
+}
+
 func TestUnknownCommand(t *testing.T) {
 	r := newRepo(t)
 	r.seed("0.4.0")

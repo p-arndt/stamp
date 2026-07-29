@@ -8,17 +8,21 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/p-arndt/stamp/internal/buildinfo"
 	"github.com/p-arndt/stamp/internal/config"
 	"github.com/p-arndt/stamp/internal/gitx"
 	"github.com/p-arndt/stamp/internal/release"
 	"github.com/p-arndt/stamp/internal/ui"
+	"github.com/p-arndt/stamp/internal/update"
 	"github.com/p-arndt/stamp/internal/version"
 )
 
@@ -29,6 +33,8 @@ Usage:
   stamp set     <patch|minor|major|x.y.z>   write the version files only, no git
   stamp current                             print the current version
   stamp verify  --tag <tag>                  check a tag against the committed version
+  stamp check-update                        report whether a newer stamp is available
+  stamp self-update                         replace this binary with the latest release
   stamp version                             print stamp's own version
 
 Flags for release:
@@ -40,10 +46,19 @@ Flags for release:
 
 Configuration is optional. Without a .stamp.yml, stamp uses a VERSION file (or
 package.json), releases from main, tags v<version> and pushes to origin.
+
+Set STAMP_NO_UPDATE_CHECK=1 to silence the passive "newer version" notice.
 `
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	args := os.Args[1:]
+
+	// A previous self-update on Windows leaves the old binary beside the new one
+	// (a running .exe can be renamed but not deleted). Sweep it up now that it
+	// is no longer running.
+	update.CleanupLeftovers()
+
+	if err := run(args); err != nil {
 		// Both errQuiet and an aborted release have already printed everything
 		// the user needs; anything else gets the standard "error: …" line.
 		if !errors.Is(err, errQuiet) && !release.IsAborted(err) {
@@ -51,6 +66,22 @@ func main() {
 		}
 		os.Exit(1)
 	}
+
+	notifyUpdate(args)
+}
+
+// notifyUpdate prints the passive "a newer stamp is available" hint after a
+// command has done its work. It goes to stderr, so `stamp current` stays usable
+// in a shell substitution, and it is suppressed for the update commands
+// themselves — they already report the version they found.
+func notifyUpdate(args []string) {
+	if len(args) > 0 {
+		switch args[0] {
+		case "self-update", "check-update":
+			return
+		}
+	}
+	update.NotifyIfAvailable(ui.Err, buildinfo.Version)
 }
 
 func run(args []string) error {
@@ -68,6 +99,10 @@ func run(args []string) error {
 		return cmdCurrent(args[1:])
 	case "verify":
 		return cmdVerify(args[1:])
+	case "self-update":
+		return cmdUpdate(false)
+	case "check-update":
+		return cmdUpdate(true)
 	case "version", "--version", "-v":
 		fmt.Fprintln(os.Stdout, buildinfo.String())
 		return nil
@@ -315,6 +350,48 @@ func cmdVerify(args []string) error {
 
 	if mismatch {
 		return errQuiet
+	}
+	return nil
+}
+
+// updateTimeout bounds the whole check-download-verify-install cycle. Generous
+// compared to the passive notice, since the user explicitly asked for it.
+const updateTimeout = 60 * time.Second
+
+// cmdUpdate backs `stamp self-update` and, with checkOnly, `stamp check-update`:
+// the first replaces the running binary with the latest release once its
+// checksum verifies, the second only reports whether a newer one exists.
+//
+// Unlike every other command it does not open a repository — updating the
+// installed binary has nothing to do with the project the user happens to be
+// standing in.
+func cmdUpdate(checkOnly bool) error {
+	current := buildinfo.Version
+	client := update.NewClient(&http.Client{Timeout: updateTimeout})
+	ctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
+	defer cancel()
+
+	ui.Blank()
+	if !checkOnly {
+		ui.Field("Current", current)
+		ui.Note("Checking for updates…")
+	}
+
+	res, err := client.SelfUpdate(ctx, current, checkOnly)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case !update.IsNewer(res.Latest, res.Current):
+		ui.Pass(fmt.Sprintf("you are on the latest version (%s)", res.Current))
+	case checkOnly:
+		ui.Step("A newer version is available: %s", ui.Bump(res.Current, res.Latest))
+		ui.Note("Run `stamp self-update` to upgrade.")
+	default:
+		ui.Blank()
+		ui.Step("Updated %s", ui.Bump(res.Current, res.Latest))
+		ui.Note("Replaced %s", res.ExePath)
 	}
 	return nil
 }

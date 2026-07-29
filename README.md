@@ -62,6 +62,19 @@ dependencies, and each release carries a `stamp_<version>_checksums.txt`.
 
 From source, with Go and [just](https://github.com/casey/just): `just install`.
 
+### Staying current
+
+A release binary keeps itself up to date. `stamp self-update` downloads the archive for
+your platform, verifies its SHA-256 against the release's checksums file, and swaps the
+running binary only if that matches — an unverified download is never installed. Use
+`stamp check-update` to look without upgrading.
+
+Every command also prints a one-line hint on **stderr** when a newer version is known,
+at most one network check per day and cached in your config directory. It is stderr and
+never stdout, so `stamp current` stays safe in a shell substitution. Silence it with
+`STAMP_NO_UPDATE_CHECK=1`. Source builds report themselves as `dev` and never check or
+self-update — there is nothing to compare a `go build` against.
+
 ## 📟 Commands
 
 | Command | What it does |
@@ -70,6 +83,8 @@ From source, with Go and [just](https://github.com/casey/just): `just install`.
 | `stamp set <patch\|minor\|major\|x.y.z>` | Write the version files only, no git. May also go backwards — it is the correction command. |
 | `stamp current` | Print the current version bare on stdout, for scripts and justfiles. |
 | `stamp verify --tag <tag>` | CI-side: does this tag match the committed version? Non-zero if not. |
+| `stamp check-update` | Report whether a newer stamp has been released. |
+| `stamp self-update` | Replace this binary with the latest release, once its checksum verifies. |
 
 | Flag for `release` | Effect |
 | --- | --- |
