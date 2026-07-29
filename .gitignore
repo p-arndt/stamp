@@ -1,0 +1,11 @@
+# Built binaries
+/stamp
+/stamp.exe
+/dist/
+
+# Go
+*.test
+*.out
+
+# Local state
+.DS_Store

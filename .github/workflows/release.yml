@@ -1,0 +1,221 @@
+name: Build and Publish Release
+permissions:
+  contents: write
+
+# Two release runs uploading assets to the same tag would race; queue them
+# instead (never cancel — a half-cancelled release could leave a tag with
+# partial assets).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Tag pushes only. The version is decided by `stamp release` before the tag
+# exists, so there is nothing for a manual run to resolve — this pipeline is
+# deliberately a worker, not a controller.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  # The tag is the only input, and it has to agree with the version committed in
+  # the repository. `stamp verify` is that check, and stamp checking its own tag
+  # is also the smallest possible end-to-end test of the CI-side command.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      VERSION: ${{ steps.version.outputs.VERSION }}
+      PRERELEASE: ${{ steps.version.outputs.PRERELEASE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify the tag against the committed version
+        run: go run . verify --tag "$GITHUB_REF_NAME"
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Bounded, semver-ish charset: keeps the version safe to splice into
+          # archive names.
+          if ! [[ "$VERSION" =~ ^[0-9][0-9A-Za-z.+-]{0,63}$ ]]; then
+            echo "::error::version '$VERSION' is not a valid release version" >&2
+            exit 1
+          fi
+          # Semver pre-release tags (e.g. v0.2.0-beta.1) are flagged automatically.
+          if [[ "$VERSION" == *-* ]]; then PRERELEASE=true; else PRERELEASE=false; fi
+          echo "VERSION=$VERSION"       >> "$GITHUB_OUTPUT"
+          echo "PRERELEASE=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+  # Nothing gets published from a commit that fails vet + tests. All three
+  # platforms run because stamp drives the git binary, whose behaviour is the
+  # part most likely to differ per OS.
+  test:
+    needs: verify
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Configure git
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+        shell: bash
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  # Every target is a static CGO_ENABLED=0 build, so all six cross-compile from
+  # one Linux runner — no per-OS build matrix, and no runner-to-runner drift in
+  # the archives.
+  build:
+    needs: [verify, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Third-party actions are pinned to full commit SHAs, not tags: tags are
+    # mutable and could be repointed to malicious code under us. Dependabot
+    # keeps these pins current.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build static binaries (windows, linux, darwin — amd64 + arm64)
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse --short HEAD)"
+          date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          module="github.com/p-arndt/stamp/internal/buildinfo"
+          ldflags="-s -w \
+            -X $module.Version=$VERSION \
+            -X $module.Commit=$commit \
+            -X $module.Date=$date"
+
+          mkdir -p dist
+          export CGO_ENABLED=0
+          for target in windows/amd64 windows/arm64 \
+                        linux/amd64 linux/arm64 \
+                        darwin/amd64 darwin/arm64; do
+            export GOOS="${target%/*}" GOARCH="${target#*/}"
+            echo "-> building $GOOS/$GOARCH"
+
+            rm -rf stage && mkdir -p stage
+            bin="stamp"
+            if [ "$GOOS" = "windows" ]; then bin="stamp.exe"; fi
+            go build -trimpath -ldflags "$ldflags" -o "stage/$bin" .
+
+            # zip on Windows, tar.gz elsewhere: the tarball preserves the exec
+            # bit, which a zip would drop and leave users chmod-ing by hand.
+            name="stamp_${VERSION}_${GOOS}_${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              (cd stage && zip -q "../dist/$name.zip" "$bin")
+            else
+              tar -czf "dist/$name.tar.gz" -C stage "$bin"
+            fi
+          done
+          rm -rf stage
+
+          # Checksums over the archives (computed before the file itself exists).
+          (cd dist && sha256sum *.zip *.tar.gz > "stamp_${VERSION}_checksums.txt")
+          ls -l dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4.4.3
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Changelog generation (orhun/git-cliff-action) is a Docker action, which only
+  # runs on Linux — so publishing happens on ubuntu after downloading the
+  # archives the build job produced.
+  release:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        with:
+          config: cliff.toml
+          args: --latest --strip all
+        env:
+          OUTPUT: CHANGELOG_BODY.md
+
+      - name: Assemble release notes
+        shell: bash
+        env:
+          PRERELEASE: ${{ needs.verify.outputs.PRERELEASE }}
+        run: |
+          set -euo pipefail
+          if [ "$PRERELEASE" = "true" ]; then
+            echo "## 🧪 Pre-release $GITHUB_REF_NAME" > RELEASE_NOTES.md
+          else
+            echo "## 🚀 Release $GITHUB_REF_NAME" > RELEASE_NOTES.md
+          fi
+          echo "" >> RELEASE_NOTES.md
+          cat CHANGELOG_BODY.md >> RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ needs.verify.outputs.PRERELEASE }}
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
