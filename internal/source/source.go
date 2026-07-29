@@ -41,8 +41,8 @@ func New(root, kind, path, field string) (Source, error) {
 	if path == "" {
 		return nil, fmt.Errorf("version source of type %q needs a path", kind)
 	}
-	if filepath.IsAbs(path) {
-		return nil, fmt.Errorf("version source path %q must be relative to the repository root", path)
+	if err := checkRelative(path); err != nil {
+		return nil, err
 	}
 
 	switch kind {
@@ -62,6 +62,33 @@ func New(root, kind, path, field string) (Source, error) {
 	default:
 		return nil, fmt.Errorf("unknown version source type %q (use %q or %q)", kind, KindFile, KindJSON)
 	}
+}
+
+// checkRelative rejects any path that could resolve outside the repository.
+//
+// filepath.IsAbs alone is not enough, because it answers differently per
+// platform: on Windows "/etc/passwd" is *not* absolute (it carries no drive) and
+// `C:\x` is not absolute on unix. A config file travels between machines, so
+// both forms are rejected everywhere, along with "..", which would walk out of
+// the repository the long way round.
+func checkRelative(path string) error {
+	bad := func(why string) error {
+		return fmt.Errorf("version source path %q %s — it must be relative to the repository root", path, why)
+	}
+
+	if filepath.IsAbs(path) || strings.HasPrefix(path, "/") || strings.HasPrefix(path, `\`) {
+		return bad("is absolute")
+	}
+	// A drive-qualified Windows path: "C:", "C:x", "C:\x".
+	if len(path) >= 2 && path[1] == ':' {
+		return bad("names a drive")
+	}
+	for _, segment := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if segment == ".." {
+			return bad(`walks up out of the repository ("..")`)
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

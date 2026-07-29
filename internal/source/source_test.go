@@ -181,8 +181,21 @@ func TestNewValidation(t *testing.T) {
 	if _, err := New(dir, KindFile, "", ""); err == nil {
 		t.Error("an empty path should be rejected")
 	}
-	if _, err := New(dir, KindFile, "/etc/passwd", ""); err == nil {
-		t.Error("an absolute path should be rejected")
+	// Rejected on every platform, not just the one whose form it is: a config
+	// file travels between machines, and filepath.IsAbs answers differently per
+	// OS ("/etc/passwd" is not absolute on Windows, `C:\x` is not on unix).
+	for _, escape := range []string{
+		"/etc/passwd",
+		`\Windows\system32\x`,
+		`C:\Windows\x`,
+		"C:relative",
+		"../outside/VERSION",
+		"nested/../../outside/VERSION",
+		`nested\..\..\outside\VERSION`,
+	} {
+		if _, err := New(dir, KindFile, escape, ""); err == nil {
+			t.Errorf("path %q should be rejected — it can resolve outside the repository", escape)
+		}
 	}
 	if _, err := New(dir, KindFile, "VERSION", "version"); err == nil {
 		t.Error("a field on a file source should be rejected")

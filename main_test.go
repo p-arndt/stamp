@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -18,7 +19,14 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	stampBin = filepath.Join(dir, "stamp")
+	// Windows will not execute a file without an executable extension, so the
+	// test binary has to carry .exe there — go build does not add it when -o
+	// names the output explicitly.
+	name := "stamp"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	stampBin = filepath.Join(dir, name)
 	build := exec.Command("go", "build", "-o", stampBin, ".")
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
@@ -48,7 +56,10 @@ func newRepo(t *testing.T) *repo {
 	mustRun(t, r.dir, "git", "config", "user.name", "Test")
 	mustRun(t, r.dir, "git", "config", "commit.gpgsign", "false")
 	mustRun(t, r.dir, "git", "config", "tag.gpgsign", "false")
-	mustRun(t, r.dir, "git", "remote", "add", "origin", r.remote)
+	// Forward slashes even on Windows: a backslash path works as a git remote
+	// most of the time, but git treats backslashes as escapes in some contexts,
+	// and a file URL with forward slashes is unambiguous on every platform.
+	mustRun(t, r.dir, "git", "remote", "add", "origin", filepath.ToSlash(r.remote))
 	return r
 }
 
