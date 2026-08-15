@@ -10,7 +10,7 @@
 #   internal/gitx        — the git commands stamp needs
 #   internal/release     — preflight, write, commit, tag, push
 #   internal/ui          — terminal output and the confirmation prompt
-#   internal/update      — self-update from GitHub Releases and the update notice
+#   (self-update and the update notice come from github.com/p-arndt/selfupdate)
 #   VERSION              — single source of truth (stamped into the binary)
 #
 # Portability: recipe bodies are plain command invocations with no shell syntax,

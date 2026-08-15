@@ -12,17 +12,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
-	"time"
 
+	"github.com/p-arndt/selfupdate"
+	upver "github.com/p-arndt/selfupdate/version"
 	"github.com/p-arndt/stamp/internal/buildinfo"
 	"github.com/p-arndt/stamp/internal/config"
 	"github.com/p-arndt/stamp/internal/gitx"
 	"github.com/p-arndt/stamp/internal/release"
 	"github.com/p-arndt/stamp/internal/ui"
-	"github.com/p-arndt/stamp/internal/update"
 	"github.com/p-arndt/stamp/internal/version"
 )
 
@@ -76,7 +75,7 @@ func main() {
 	// A previous self-update on Windows leaves the old binary beside the new one
 	// (a running .exe can be renamed but not deleted). Sweep it up now that it
 	// is no longer running.
-	update.CleanupLeftovers()
+	selfupdate.CleanupLeftovers()
 
 	if err := run(args); err != nil {
 		// Both errQuiet and an aborted release have already printed everything
@@ -101,7 +100,36 @@ func notifyUpdate(args []string) {
 			return
 		}
 	}
-	update.NotifyIfAvailable(ui.Err, buildinfo.Version)
+	// Best effort: a passive hint is never worth failing a command over, so a
+	// misconfigured updater simply stays quiet.
+	if up, err := newUpdater(selfupdate.Config{}); err == nil {
+		up.NotifyIfAvailable(ui.Err, buildinfo.Version)
+	}
+}
+
+// Repo coordinates for the published releases.
+const (
+	updateOwner = "p-arndt"
+	updateRepo  = "stamp"
+)
+
+// newUpdater builds stamp's updater.
+//
+// Everything except the coordinates and the name of the update command is the
+// library's default, and that is deliberate: the defaults describe exactly what
+// .github/workflows/release.yml publishes — stamp_<version>_<goos>_<goarch>
+// archives with the binary inside, stamp_<version>_checksums.txt beside them,
+// and STAMP_NO_UPDATE_CHECK as the opt-out. Overriding any of it here would
+// mean the workflow and the updater could drift apart silently.
+//
+// cfg carries the test seams (APIBase, StatePath, ExecutablePath); production
+// passes the zero value.
+func newUpdater(cfg selfupdate.Config) (*selfupdate.Updater, error) {
+	cfg.Owner = updateOwner
+	cfg.Repo = updateRepo
+	// The library would default this to "stamp update".
+	cfg.UpdateCmd = "stamp self-update"
+	return selfupdate.New(cfg)
 }
 
 func run(args []string) error {
@@ -400,10 +428,6 @@ func cmdVerify(args []string) error {
 	return nil
 }
 
-// updateTimeout bounds the whole check-download-verify-install cycle. Generous
-// compared to the passive notice, since the user explicitly asked for it.
-const updateTimeout = 60 * time.Second
-
 // cmdUpdate backs `stamp self-update` and, with checkOnly, `stamp check-update`:
 // the first replaces the running binary with the latest release once its
 // checksum verifies, the second only reports whether a newer one exists.
@@ -411,11 +435,22 @@ const updateTimeout = 60 * time.Second
 // Unlike every other command it does not open a repository — updating the
 // installed binary has nothing to do with the project the user happens to be
 // standing in.
+//
+// The library ships a Run() that prints its own report; stamp calls the lower
+// level SelfUpdate instead so the output stays in stamp's own voice. The whole
+// cycle is bounded by the updater's UpdateTimeout, so the context carries no
+// deadline of its own.
 func cmdUpdate(checkOnly bool) error {
-	current := buildinfo.Version
-	client := update.NewClient(&http.Client{Timeout: updateTimeout})
-	ctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
-	defer cancel()
+	return runUpdate(context.Background(), selfupdate.Config{}, buildinfo.Version, checkOnly)
+}
+
+// runUpdate is cmdUpdate with its seams exposed, so a test can point it at a
+// fake release without reaching the network.
+func runUpdate(ctx context.Context, cfg selfupdate.Config, current string, checkOnly bool) error {
+	up, err := newUpdater(cfg)
+	if err != nil {
+		return err
+	}
 
 	ui.Blank()
 	if !checkOnly {
@@ -423,13 +458,13 @@ func cmdUpdate(checkOnly bool) error {
 		ui.Note("Checking for updates…")
 	}
 
-	res, err := client.SelfUpdate(ctx, current, checkOnly)
+	res, err := up.SelfUpdate(ctx, current, checkOnly)
 	if err != nil {
 		return err
 	}
 
 	switch {
-	case !update.IsNewer(res.Latest, res.Current):
+	case !upver.IsNewer(res.Latest, res.Current):
 		ui.Pass(fmt.Sprintf("you are on the latest version (%s)", res.Current))
 	case checkOnly:
 		ui.Step("A newer version is available: %s", ui.Bump(res.Current, res.Latest))

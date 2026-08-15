@@ -31,6 +31,16 @@ duplizierte `scripts/release.mjs` + `scripts/set-version.mjs`.
   über GitHub Releases, also ist der Updater die Verteilung — ohne ihn hängt
   jede Installation auf ihrer Version fest. `STAMP_NO_UPDATE_CHECK=1` schaltet
   den Hinweis ab; Dev-Builds prüfen nie.
+- Ersetzt (2026-08-15): `internal/update` ist raus, der Updater kommt jetzt aus
+  `github.com/p-arndt/selfupdate` v0.1.0 — dieselbe Sache, aber einmal gepflegt
+  statt je Repo kopiert. Die Bibliothek trifft stamps Release-Layout
+  vollständig mit ihren Defaults (`stamp_<version>_<goos>_<goarch>.tar.gz|.zip`,
+  `stamp_<version>_checksums.txt`, `STAMP_NO_UPDATE_CHECK`,
+  `<UserConfigDir>/stamp/update-check.json`); gesetzt wird nur `UpdateCmd`, weil
+  das Kommando hier `stamp self-update` heißt und nicht `stamp update`.
+  Ausgegeben wird weiter über `internal/ui` — deshalb `SelfUpdate` statt des
+  fertigen `Run()`. Signaturprüfung (`verify.Ed25519`) bleibt vorerst aus: der
+  Release-Workflow signiert nichts, und ein Key will verwaltet werden.
 - Nachträglich ergänzt (2026-08-15): `stamp prerelease <patch|minor|major>` als
   eigenes Kommando, mit `--type <id>` und Default aus `release.prerelease`
   (Fallback `beta`). Der Bump-Keyword nennt die kleinste Eskalation der
