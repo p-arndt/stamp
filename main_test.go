@@ -269,6 +269,96 @@ func TestReleaseExplicitAndPrereleaseVersions(t *testing.T) {
 	}
 }
 
+// The full pre-release cycle: open a series, move within it, switch identifier,
+// then promote to the stable release.
+func TestPrereleaseCycle(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	steps := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"prerelease", "minor", "--yes"}, "0.5.0-beta.1"},
+		{[]string{"prerelease", "minor", "--yes"}, "0.5.0-beta.2"},
+		{[]string{"prerelease", "patch", "--type", "rc", "--yes"}, "0.5.0-rc.1"},
+		{[]string{"release", "final", "--yes"}, "0.5.0"},
+	}
+	for _, step := range steps {
+		r.mustStamp(step.args...)
+		if got := r.read("VERSION"); got != step.want+"\n" {
+			t.Fatalf("after stamp %v: VERSION = %q, want %q", step.args, got, step.want)
+		}
+		if !strings.Contains(r.git("tag", "--list"), "v"+step.want) {
+			t.Fatalf("after stamp %v: tag v%s is missing", step.args, step.want)
+		}
+	}
+	// Every tag reached the remote, in order.
+	requireContains(t, r.remoteGit("tag", "--list"),
+		"v0.5.0-beta.1", "v0.5.0-beta.2", "v0.5.0-rc.1", "v0.5.0")
+}
+
+// Once a series is running, --type is not needed again: the identifier is
+// inherited from the current version. Taking the configured default instead
+// would resolve backwards (rc.1 -> beta.1) and fail the preflight.
+func TestPrereleaseStaysInItsSeries(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	r.mustStamp("prerelease", "minor", "--type", "rc", "--yes")
+	// Bare: no bump needed to walk a running series.
+	r.mustStamp("prerelease", "--yes")
+	if got := r.read("VERSION"); got != "0.5.0-rc.2\n" {
+		t.Fatalf("VERSION = %q, want 0.5.0-rc.2", got)
+	}
+	// A new series on a higher base does fall back to the default identifier.
+	r.mustStamp("prerelease", "major", "--yes")
+	if got := r.read("VERSION"); got != "1.0.0-beta.1\n" {
+		t.Errorf("VERSION = %q, want 1.0.0-beta.1", got)
+	}
+}
+
+// The identifier comes from the config when --type is absent, and the plan says
+// out loud that this is not a stable release.
+func TestPrereleaseIdentifierFromConfig(t *testing.T) {
+	r := newRepo(t)
+	r.write("VERSION", "0.4.0\n")
+	r.write(".stamp.yml", "release:\n  prerelease: alpha\n")
+	r.commitAll("initial")
+	r.push()
+
+	out := r.mustStamp("prerelease", "patch", "--dry-run")
+	requireContains(t, out, "0.4.1-alpha.1", "Pre-release", "not a stable release")
+	if got := r.read("VERSION"); got != "0.4.0\n" {
+		t.Errorf("dry run wrote %q", got)
+	}
+}
+
+// Without a running series there is nothing for a bare `stamp prerelease` to
+// continue, and stamp says which keyword is missing rather than guessing one.
+func TestBarePrereleaseNeedsASeries(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	out, code := r.stamp("prerelease", "--yes")
+	if code == 0 {
+		t.Fatalf("expected a failure, got:\n%s", out)
+	}
+	requireContains(t, out, "0.4.0 is not a pre-release", "patch, minor or major")
+}
+
+// An explicit version is `stamp release`'s job; prerelease only takes a bump.
+func TestPrereleaseRejectsExplicitVersion(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	out, code := r.stamp("prerelease", "1.0.0-beta.1", "--yes")
+	if code == 0 {
+		t.Fatalf("expected a failure, got:\n%s", out)
+	}
+	requireContains(t, out, "stamp release")
+}
+
 // A package.json project: the version changes and nothing else does.
 func TestReleaseKeepsPackageJSONFormatting(t *testing.T) {
 	const pkg = "{\n\t\"name\": \"thing\",\n\t\"version\": \"0.1.0\",\n\t\"scripts\": {\n\t\t\"build\": \"vite build\"\n\t}\n}\n"

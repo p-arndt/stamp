@@ -31,6 +31,24 @@ duplizierte `scripts/release.mjs` + `scripts/set-version.mjs`.
   über GitHub Releases, also ist der Updater die Verteilung — ohne ihn hängt
   jede Installation auf ihrer Version fest. `STAMP_NO_UPDATE_CHECK=1` schaltet
   den Hinweis ab; Dev-Builds prüfen nie.
+- Nachträglich ergänzt (2026-08-15): `stamp prerelease <patch|minor|major>` als
+  eigenes Kommando, mit `--type <id>` und Default aus `release.prerelease`
+  (Fallback `beta`). Der Bump-Keyword nennt die kleinste Eskalation der
+  kommenden stabilen Version; ist die Ziel-Basis noch unveröffentlicht, läuft
+  nur der Zähler weiter (`1.3.0-beta.1` → `1.3.0-beta.2`). Innerhalb einer
+  laufenden Serie trägt das Keyword deshalb keine Information — dort ist es
+  optional, `stamp prerelease` allein schneidet den nächsten Kandidaten. Auf
+  einer stabilen Version bleibt es Pflicht, weil sonst nichts sagt, ob die
+  Serie auf `1.2.4` oder `2.0.0` zielt. Dazu `stamp release
+  final`, das eine Prerelease zu ihrem Release promotet. Es geht auch ohne —
+  `release patch` auf `1.3.0-rc.1` ergibt `1.3.0`, weil Masterminds' `IncPatch`
+  bei vorhandener Prerelease nur diese verwirft — aber das muss man wissen, und
+  der naheliegende Griff zu `release minor` ergibt `1.4.0` und überspringt
+  `1.3.0` still. `final` benennt die Absicht und bricht ab, wenn es nichts zu
+  promoten gibt. Der Identifier wird ohne `--type` aus der laufenden Serie
+  übernommen, sonst aus der Config — der Config-Default mitten in einer
+  rc-Serie hieße Rückschritt auf `beta` und damit Preflight-Abbruch. Preflight bleibt unverändert: Prereleases laufen durch
+  dieselben Checks, der Plan zeigt nur eine zusätzliche Info-Zeile.
 
 ### Out of scope
 
@@ -38,6 +56,8 @@ duplizierte `scripts/release.mjs` + `scripts/set-version.mjs`.
   stamp prüft ausschließlich git-Zustand und Version. Tests sind Sache der CI.
 - `--no-commit` — macht Tag/Version/git-Zustand unnötig kompliziert
 - `stamp release retry` — später, nicht in v1
+- Prerelease-spezifische Lockerungen (z. B. Release von einem Feature-Branch
+  ohne `--branch`) — bewusst nicht, ein Prerelease ist ein normaler Release
 - Workspace-Fan-Out (pnpm-workspaces automatisch scannen) und Glob-Mirrors;
   Monorepos listen ihre Pfade explizit als mirrors auf
 - Cargo.toml / Rust (myterm bleibt außen vor)

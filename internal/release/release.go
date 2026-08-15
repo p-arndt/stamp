@@ -34,6 +34,11 @@ type Options struct {
 	NoFetch bool
 	// Branch overrides the configured release branch for this run.
 	Branch string
+	// Pre cuts a pre-release: Arg is read as the bump the coming stable
+	// release stands for, and PreID names the series.
+	Pre bool
+	// PreID overrides the configured pre-release identifier for this run.
+	PreID string
 }
 
 // Plan is everything stamp resolved before touching the repository.
@@ -75,7 +80,7 @@ func Prepare(cfg *config.Config, repo *gitx.Repo, opts Options) (*Plan, error) {
 	}
 	p.Current = current
 
-	next, err := version.Resolve(current, opts.Arg)
+	next, err := resolve(cfg, opts, current)
 	if err != nil {
 		return nil, err
 	}
@@ -93,6 +98,30 @@ func Prepare(cfg *config.Config, repo *gitx.Repo, opts Options) (*Plan, error) {
 		return p, err
 	}
 	return p, nil
+}
+
+// resolve turns the CLI argument into the target version, as a plain bump or,
+// for `stamp prerelease`, as the next pre-release of that bump.
+//
+// Where the identifier comes from, in order: --type, then the series the
+// current version is already in, then the configured default. The middle step
+// is what keeps a series walkable — after `--type rc` put the project on
+// 1.3.0-rc.1, a plain `stamp prerelease patch` has to continue at rc.2. Taking
+// the configured default there would resolve to 1.3.0-beta.1, which is *lower*
+// in semver, so the run would die in preflight and every further cut would need
+// --type rc forever.
+func resolve(cfg *config.Config, opts Options, current string) (string, error) {
+	if !opts.Pre {
+		return version.Resolve(current, opts.Arg)
+	}
+	id := opts.PreID
+	if id == "" && version.ContinuesSeries(current, opts.Arg) {
+		id = version.PreIDOf(current)
+	}
+	if id == "" {
+		id = cfg.PreID
+	}
+	return version.ResolvePre(current, opts.Arg, id)
 }
 
 // preflight fills p.checks. It returns an error only for problems that make the
@@ -234,8 +263,15 @@ func (p *Plan) WillPush() bool { return p.Config.Push && !p.Options.NoPush }
 
 // Print renders the plan and the check list.
 func (p *Plan) Print() {
-	ui.Title("Release %s", p.Config.ProjectName)
+	title := "Release %s"
+	if p.Options.Pre {
+		title = "Pre-release %s"
+	}
+	ui.Title(title, p.Config.ProjectName)
 	ui.Field("Version", ui.Bump(p.Current, p.Next))
+	if pre := version.PreOf(p.Next); pre != "" {
+		ui.Field("Pre-release", fmt.Sprintf("%s (not a stable release)", pre))
+	}
 	if !p.Unchanged {
 		ui.Field("Commit", p.Commit)
 	}

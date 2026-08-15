@@ -61,3 +61,115 @@ func TestCompare(t *testing.T) {
 		t.Errorf("1.0.0-beta.1 -> 1.0.0: equal=%v err=%v", equal, err)
 	}
 }
+
+func TestResolvePre(t *testing.T) {
+	cases := []struct {
+		current, kind, id, want string
+	}{
+		// A fresh series starts at .1 on the bumped base.
+		{"1.2.3", "patch", "beta", "1.2.4-beta.1"},
+		{"1.2.3", "minor", "beta", "1.3.0-beta.1"},
+		{"1.2.3", "major", "beta", "2.0.0-beta.1"},
+		{"1.2.3", "patch", "", "1.2.4-beta.1"}, // the default identifier
+		// Mid-series the base stays put and only the counter moves — the base
+		// was never released, so there is nothing to bump past.
+		{"1.2.4-beta.1", "patch", "beta", "1.2.4-beta.2"},
+		{"1.3.0-beta.1", "minor", "beta", "1.3.0-beta.2"},
+		{"1.3.0-beta.9", "patch", "beta", "1.3.0-beta.10"},
+		{"2.0.0-beta.1", "major", "beta", "2.0.0-beta.2"},
+		// A base that does not satisfy the requested bump escalates.
+		{"1.2.4-beta.1", "minor", "beta", "1.3.0-beta.1"},
+		{"1.3.0-beta.1", "major", "beta", "2.0.0-beta.1"},
+		// A new identifier restarts the counter on the same base.
+		{"1.3.0-beta.2", "patch", "rc", "1.3.0-rc.1"},
+		// A pre-release without a counter is treated as .0.
+		{"1.3.0-beta", "patch", "beta", "1.3.0-beta.1"},
+		// No bump at all: the next candidate of the running series.
+		{"1.3.0-beta.1", "", "beta", "1.3.0-beta.2"},
+		{"1.2.4-rc.7", "", "rc", "1.2.4-rc.8"},
+	}
+	for _, c := range cases {
+		got, err := ResolvePre(c.current, c.kind, c.id)
+		if err != nil {
+			t.Errorf("ResolvePre(%q, %q, %q): %v", c.current, c.kind, c.id, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("ResolvePre(%q, %q, %q) = %q, want %q", c.current, c.kind, c.id, got, c.want)
+		}
+	}
+}
+
+func TestResolvePreRejects(t *testing.T) {
+	// An explicit version is `stamp release`'s job, and an identifier has to be
+	// a legal semver pre-release.
+	for _, c := range []struct{ kind, id string }{
+		{"1.3.0", "beta"},
+		{"", "beta"}, // 1.2.3 is stable — there is no series to continue
+		{"nonsense", "beta"},
+		{"patch", "beta 1"},
+		{"patch", "beta_1"},
+		{"patch", "beta."},
+	} {
+		if got, err := ResolvePre("1.2.3", c.kind, c.id); err == nil {
+			t.Errorf("ResolvePre(1.2.3, %q, %q) = %q, want an error", c.kind, c.id, got)
+		}
+	}
+}
+
+// Going from a later identifier back to an earlier one is downwards in semver
+// and must be caught by the ordinary version check, not silently tagged.
+func TestPreSeriesOrder(t *testing.T) {
+	if _, err := Compare("1.3.0-rc.1", "1.3.0-beta.1"); err == nil {
+		t.Error("rc.1 -> beta.1 should fail")
+	}
+	if _, err := Compare("1.3.0-beta.1", "1.3.0-rc.1"); err != nil {
+		t.Errorf("beta.1 -> rc.1: %v", err)
+	}
+}
+
+func TestResolveFinal(t *testing.T) {
+	got, err := Resolve("1.3.0-rc.2", Final)
+	if err != nil || got != "1.3.0" {
+		t.Errorf("Resolve(1.3.0-rc.2, final) = %q, %v; want 1.3.0", got, err)
+	}
+	// Nothing to promote from a stable version.
+	if _, err := Resolve("1.3.0", Final); err == nil {
+		t.Error("final on a stable version should fail")
+	}
+}
+
+func TestContinuesSeries(t *testing.T) {
+	cases := []struct {
+		current, kind string
+		want          bool
+	}{
+		{"1.3.0-rc.1", "patch", true},
+		{"1.3.0-rc.1", "minor", true},  // the base is a minor version already
+		{"1.3.0-rc.1", "major", false}, // 2.0.0 is a new series
+		{"1.2.4-beta.1", "minor", false},
+		{"1.2.3", "patch", false}, // no series to continue
+		{"1.3.0-rc.1", "", true},  // a bare `stamp prerelease` continues it
+		{"1.2.3", "", false},
+		{"nonsense", "patch", false},
+	}
+	for _, c := range cases {
+		if got := ContinuesSeries(c.current, c.kind); got != c.want {
+			t.Errorf("ContinuesSeries(%q, %q) = %v, want %v", c.current, c.kind, got, c.want)
+		}
+	}
+}
+
+func TestPreIDOf(t *testing.T) {
+	for in, want := range map[string]string{
+		"1.3.0-rc.2":      "rc",
+		"1.3.0-beta":      "beta",
+		"1.3.0-alpha.1.2": "alpha.1",
+		"1.3.0":           "",
+		"nonsense":        "",
+	} {
+		if got := PreIDOf(in); got != want {
+			t.Errorf("PreIDOf(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/p-arndt/stamp/internal/source"
+	"github.com/p-arndt/stamp/internal/version"
 	"gopkg.in/yaml.v3"
 )
 
@@ -49,6 +50,8 @@ type Config struct {
 	CommitTemplate string
 	// Push reports whether stamp pushes by default.
 	Push bool
+	// PreID is the default pre-release identifier for `stamp prerelease`.
+	PreID string
 	// FromFile records whether a .stamp.yml was found, for the plan output.
 	FromFile bool
 }
@@ -65,11 +68,12 @@ type file struct {
 		Mirrors []sourceSpec `yaml:"mirrors"`
 	} `yaml:"version"`
 	Release struct {
-		Branch string `yaml:"branch"`
-		Remote string `yaml:"remote"`
-		Tag    string `yaml:"tag"`
-		Commit string `yaml:"commit"`
-		Push   *bool  `yaml:"push"`
+		Branch     string `yaml:"branch"`
+		Remote     string `yaml:"remote"`
+		Tag        string `yaml:"tag"`
+		Commit     string `yaml:"commit"`
+		Push       *bool  `yaml:"push"`
+		Prerelease string `yaml:"prerelease"`
 	} `yaml:"release"`
 }
 
@@ -88,6 +92,7 @@ func Load(root string) (*Config, error) {
 		TagTemplate:    DefaultTag,
 		CommitTemplate: DefaultCommit,
 		Push:           true,
+		PreID:          version.DefaultPreID,
 	}
 
 	raw, err := os.ReadFile(filepath.Join(root, FileName))
@@ -128,6 +133,9 @@ func Load(root string) (*Config, error) {
 	}
 	if f.Release.Push != nil {
 		cfg.Push = *f.Release.Push
+	}
+	if f.Release.Prerelease != "" {
+		cfg.PreID = f.Release.Prerelease
 	}
 
 	if f.Version.Source == nil {

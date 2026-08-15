@@ -39,7 +39,8 @@ in one commit. Everything on screen is a real release of a throwaway repository 
 | **Version sources** | A plain text file (`VERSION`) · a JSON field (`package.json`, or any file and field) |
 | **Mirrors** | Any number of further locations, of either kind, bumped in the same commit |
 | **Version formats** | Strict semver, including pre-releases (`1.0.0-beta.1`) and build metadata |
-| **Bumps** | `patch` · `minor` · `major` · any explicit version |
+| **Bumps** | `patch` · `minor` · `major` · `final` · any explicit version |
+| **Pre-releases** | `stamp prerelease minor` opens a `beta` series and walks it: `-beta.1`, `-beta.2`, … |
 | **Tag styles** | `v0.5.0`, `0.5.0`, or whatever your template renders |
 | **Detected without config** | `VERSION` file · `package.json` |
 | **File formatting** | Preserved byte for byte apart from the version literal — tabs stay tabs, key order stays put, the diff is one line |
@@ -79,22 +80,52 @@ self-update — there is nothing to compare a `go build` against.
 
 | Command | What it does |
 | --- | --- |
-| `stamp release <patch\|minor\|major\|x.y.z>` | The whole release: resolve, check, write, commit, tag, push. |
-| `stamp set <patch\|minor\|major\|x.y.z>` | Write the version files only, no git. May also go backwards — it is the correction command. |
+| `stamp release <patch\|minor\|major\|final\|x.y.z>` | The whole release: resolve, check, write, commit, tag, push. `final` promotes a pre-release to the release it was for, dropping the pre-release and bumping nothing. |
+| `stamp prerelease [patch\|minor\|major]` | The same, cut as a pre-release: `1.2.3` → `1.3.0-beta.1`. Bare, it cuts the next candidate of the series already running. |
+| `stamp set <patch\|minor\|major\|final\|x.y.z>` | Write the version files only, no git. May also go backwards — it is the correction command. |
 | `stamp current` | Print the current version bare on stdout, for scripts and justfiles. |
 | `stamp verify --tag <tag>` | CI-side: does this tag match the committed version? Non-zero if not. |
 | `stamp check-update` | Report whether a newer stamp has been released. |
 | `stamp self-update` | Replace this binary with the latest release, once its checksum verifies. |
 
-| Flag for `release` | Effect |
+| Flag for `release` and `prerelease` | Effect |
 | --- | --- |
 | `--dry-run` | Print the plan and the checks, change nothing. |
 | `--no-push` | Write, commit and tag locally; print the push command for later. |
 | `--no-fetch` | Skip the network checks. Useful offline; the remote state is then unverified. |
 | `--branch <name>` | Release from this branch instead of the configured one. |
 | `-y`, `--yes` | Skip the confirmation prompt. Required in a non-interactive shell — stamp never releases on an unanswered prompt. |
+| `--type <id>` | `prerelease` only: the identifier of the series — `beta`, `rc`, `alpha`, anything semver accepts. |
 
 Flags may come before or after the version: `stamp release minor --dry-run` works.
+
+### Pre-releases
+
+`stamp prerelease` takes the same bump keyword as `release`, but reads it as *the smallest
+escalation the coming stable release stands for*. As long as that target version has not
+been reached, repeating the command only walks the counter — the base stays put, because a
+version that was never released has nothing to bump past:
+
+```
+$ stamp prerelease minor      1.2.3        → 1.3.0-beta.1
+$ stamp prerelease            1.3.0-beta.1 → 1.3.0-beta.2   # same target, next candidate
+$ stamp prerelease --type rc  1.3.0-beta.2 → 1.3.0-rc.1     # new series, counter restarts
+$ stamp prerelease major      1.3.0-rc.1   → 2.0.0-beta.1   # larger bump, new base
+$ stamp release final         1.3.0-rc.1   → 1.3.0          # promoted, pre-release dropped
+```
+
+The bump says which release the series is being cut *for*, so it is only needed to open a
+series or to move it to a higher one — inside a running series all three keywords resolve
+to the same next candidate, and a bare `stamp prerelease` says so. Off a stable version it
+is required: nothing else tells stamp whether `1.2.3` is heading for `1.2.4` or `2.0.0`. Every step is a normal release — commit, annotated tag, one push — and the
+tag carries the pre-release (`v1.3.0-beta.1`), so a pipeline can tell a candidate from a
+release by the tag alone.
+
+Without `--type` stamp stays in the series the current version is already in, so walking an
+`rc` series does not need the flag repeated. Only a *new* series takes its identifier from
+`release.prerelease` in `.stamp.yml`, and from `beta` when that is unset. Going backwards
+inside a series (`rc.1` → `beta.1`) is lower in semver and fails the preflight like any
+other downgrade.
 
 There is deliberately **no `--no-commit`**: a tag without its version commit makes the
 repository state ambiguous, and the whole point is that the tag and the committed version
@@ -201,6 +232,7 @@ Optional. Without a `.stamp.yml`:
 | Tag | `v{{ version }}` |
 | Commit | `release: {{ tag }}` |
 | Push | yes |
+| Pre-release identifier | `beta` |
 
 Everything your project does differently goes in `.stamp.yml` in the repository root:
 
@@ -224,6 +256,7 @@ release:
   tag: "v{{ version }}"         # "{{ version }}" for tags without a v prefix
   commit: "release: {{ tag }}"
   push: true
+  prerelease: beta              # identifier for `stamp prerelease`; --type overrides it
 ```
 
 A Node project, where `package.json` *is* the source of truth:

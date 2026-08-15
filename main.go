@@ -29,20 +29,40 @@ import (
 const usage = `stamp — cut a release locally: version, commit, tag, push.
 
 Usage:
-  stamp release <patch|minor|major|x.y.z>   resolve, write, commit, tag and push
-  stamp set     <patch|minor|major|x.y.z>   write the version files only, no git
-  stamp current                             print the current version
-  stamp verify  --tag <tag>                  check a tag against the committed version
-  stamp check-update                        report whether a newer stamp is available
-  stamp self-update                         replace this binary with the latest release
-  stamp version                             print stamp's own version
+  stamp release    <patch|minor|major|final|x.y.z>
+                                              resolve, write, commit, tag and push
+  stamp prerelease [patch|minor|major]        the same, for a pre-release (beta, rc, …)
+  stamp set        <patch|minor|major|final|x.y.z>
+                                              write the version files only, no git
+  stamp current                               print the current version
+  stamp verify --tag <tag>                    check a tag against the committed version
+  stamp check-update                          report whether a newer stamp is available
+  stamp self-update                           replace this binary with the latest release
+  stamp version                               print stamp's own version
 
-Flags for release:
+Flags for release and prerelease:
   --dry-run          show the plan and the checks, change nothing
   --no-push          write, commit and tag locally, do not push
   --no-fetch         skip the network checks (branch up to date, tag free on remote)
   --branch <name>    release from this branch instead of the configured one
   -y, --yes          skip the confirmation prompt
+  --type <id>        prerelease only: the identifier, e.g. beta, rc, alpha
+
+A pre-release moves within its series until it is promoted:
+
+  stamp prerelease minor            1.2.3 -> 1.3.0-beta.1
+  stamp prerelease                  1.3.0-beta.1 -> 1.3.0-beta.2
+  stamp prerelease --type rc        1.3.0-beta.2 -> 1.3.0-rc.1
+  stamp prerelease major            1.3.0-rc.1 -> 2.0.0-beta.1
+  stamp release final               1.3.0-rc.1 -> 1.3.0
+
+The bump says which release the series is being cut for, so it is only needed
+to open a series or to move it to a higher one — a bare "stamp prerelease" cuts
+the next candidate of the series already running.
+
+Without --type stamp stays in the series the current version is already in; a
+new series takes its identifier from release.prerelease in .stamp.yml, and from
+"beta" when that is unset.
 
 Configuration is optional. Without a .stamp.yml, stamp uses a VERSION file (or
 package.json), releases from main, tags v<version> and pushes to origin.
@@ -92,7 +112,9 @@ func run(args []string) error {
 
 	switch args[0] {
 	case "release":
-		return cmdRelease(args[1:])
+		return cmdRelease(args[1:], false)
+	case "prerelease", "pre":
+		return cmdRelease(args[1:], true)
 	case "set":
 		return cmdSet(args[1:])
 	case "current":
@@ -166,22 +188,46 @@ func load() (*config.Config, *gitx.Repo, error) {
 	return cfg, repo, nil
 }
 
-func cmdRelease(args []string) error {
-	var opts release.Options
-	fs := flag.NewFlagSet("release", flag.ContinueOnError)
+// cmdRelease backs both `stamp release` and, with pre, `stamp prerelease`.
+// The two share every flag, every check and the whole run — they differ only in
+// how the bump argument is turned into a version.
+func cmdRelease(args []string, pre bool) error {
+	name := "release"
+	if pre {
+		name = "prerelease"
+	}
+	opts := release.Options{Pre: pre}
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "show the plan, change nothing")
 	fs.BoolVar(&opts.NoPush, "no-push", false, "commit and tag locally, do not push")
 	fs.BoolVar(&opts.NoFetch, "no-fetch", false, "skip the network checks")
 	fs.StringVar(&opts.Branch, "branch", "", "release from this branch")
 	fs.BoolVar(&opts.Yes, "yes", false, "skip the confirmation prompt")
 	fs.BoolVar(&opts.Yes, "y", false, "skip the confirmation prompt")
-	if err := fs.Parse(splitFlags(args, "branch")); err != nil {
+	if pre {
+		fs.StringVar(&opts.PreID, "type", "", "pre-release identifier, e.g. beta or rc")
+	}
+	if err := fs.Parse(splitFlags(args, "branch", "type")); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: stamp release <patch|minor|major|x.y.z> [flags]")
+	// The bump is optional for a pre-release: inside a running series it would
+	// carry no information, since all three keywords resolve to the same next
+	// candidate. Off a stable version it is required, and version.ResolvePre
+	// says so — with the current version in the message, which a usage line
+	// could not do.
+	maxArgs := 1
+	if pre && fs.NArg() == 0 {
+		maxArgs = 0
 	}
-	opts.Arg = fs.Arg(0)
+	if fs.NArg() != maxArgs {
+		if pre {
+			return fmt.Errorf("usage: stamp prerelease [patch|minor|major] [--type <id>] [flags]")
+		}
+		return fmt.Errorf("usage: stamp release <patch|minor|major|final|x.y.z> [flags]")
+	}
+	if fs.NArg() == 1 {
+		opts.Arg = fs.Arg(0)
+	}
 
 	cfg, repo, err := load()
 	if err != nil {
@@ -239,7 +285,7 @@ func cmdSet(args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: stamp set <patch|minor|major|x.y.z>")
+		return fmt.Errorf("usage: stamp set <patch|minor|major|final|x.y.z>")
 	}
 
 	cfg, _, err := load()
