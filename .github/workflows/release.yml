@@ -166,9 +166,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Changelog generation (orhun/git-cliff-action) is a Docker action, which only
-  # runs on Linux, so publishing happens on ubuntu after downloading the
-  # archives the build job produced.
+  # Publishing is pure download-and-upload: it pulls the archives the build job
+  # produced and attaches them to the GitHub Release, so it needs no toolchain
+  # and the cheapest runner does. ubuntu is that runner.
   release:
     needs: [verify, build]
     runs-on: ubuntu-latest
@@ -187,14 +187,10 @@ jobs:
           name: dist
           path: dist
 
-      - name: Generate changelog
-        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
-        with:
-          config: cliff.toml
-          args: --latest --strip all
-        env:
-          OUTPUT: CHANGELOG_BODY.md
-
+      # The notes were written by a human before the tag existed: `stamp release`
+      # renders the changelog section into the annotated tag message, so the tag
+      # this run was triggered by already carries its own release notes. Nothing
+      # is generated here.
       - name: Assemble release notes
         shell: bash
         env:
@@ -207,7 +203,17 @@ jobs:
             echo "## 🚀 Release $GITHUB_REF_NAME" > RELEASE_NOTES.md
           fi
           echo "" >> RELEASE_NOTES.md
-          cat CHANGELOG_BODY.md >> RELEASE_NOTES.md
+
+          body="$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME")"
+          # A lightweight tag, an older tag, or a repository not using the
+          # changelog has no body. Point at the history rather than publishing an
+          # empty release page.
+          if [ -n "${body//[[:space:]]/}" ]; then
+            printf '%s\n' "$body" >> RELEASE_NOTES.md
+          else
+            printf 'See the [commit history](%s/commits/%s) for what changed.\n' \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> RELEASE_NOTES.md
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2

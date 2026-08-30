@@ -13,12 +13,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/p-arndt/selfupdate"
 	upver "github.com/p-arndt/selfupdate/version"
 	"github.com/p-arndt/stamp/internal/buildinfo"
+	"github.com/p-arndt/stamp/internal/changelog"
 	"github.com/p-arndt/stamp/internal/config"
 	"github.com/p-arndt/stamp/internal/gitx"
 	"github.com/p-arndt/stamp/internal/release"
@@ -37,6 +40,9 @@ Usage:
                                               the same, for a pre-release (beta, rc, …)
   stamp set        [component] <patch|minor|major|final|x.y.z>
                                               write the version files only, no git
+  stamp note       [component] <added|changed|deprecated|removed|fixed|security> <text>
+                                              record one user-facing change for the changelog
+  stamp changelog  [component]                print the entries noted since the last release
   stamp current    [component]                print the current version
   stamp verify --tag <tag>                    check a tag against the committed version
   stamp check-update                          report whether a newer stamp is available
@@ -65,6 +71,7 @@ Flags for release and prerelease:
   --no-push          write, commit and tag locally, do not push
   --no-fetch         skip the network checks (branch up to date, tag free on remote)
   --branch <name>    release from this branch instead of the configured one
+  --edit             open the rendered changelog section in $EDITOR first
   -y, --yes          skip the confirmation prompt
   --type <id>        prerelease only: the identifier, e.g. beta, rc, alpha
 
@@ -100,6 +107,19 @@ Components
 
   A component inherits every release key and overrides only the ones it names.
   Without a component name stamp refuses to guess and lists the names instead.
+
+Changelog
+
+  stamp note added "Pre-releases open a beta series"
+
+  writes .stamp/changelog/pre-releases-open-a-beta-series.added.md, a markdown
+  file committed with the change it describes. "stamp release" collects the
+  fragments, renders them into CHANGELOG.md, deletes them, and puts the same
+  section into the annotated tag, all in the release commit. "stamp changelog"
+  prints what has piled up so far.
+
+  It is opt-in by use: a repository that has never run "stamp note", has no
+  CHANGELOG.md and declares no changelog: block releases exactly as before.
 
 Pre-releases
 
@@ -206,6 +226,10 @@ func run(args []string) error {
 		return cmdRelease(args[1:], true)
 	case "set":
 		return cmdSet(args[1:])
+	case "note":
+		return cmdNote(args[1:])
+	case "changelog":
+		return cmdChangelog(args[1:])
 	case "current":
 		return cmdCurrent(args[1:])
 	case "verify":
@@ -339,6 +363,7 @@ func cmdRelease(args []string, pre bool) error {
 	fs.BoolVar(&opts.NoPush, "no-push", false, "commit and tag locally, do not push")
 	fs.BoolVar(&opts.NoFetch, "no-fetch", false, "skip the network checks")
 	fs.StringVar(&opts.Branch, "branch", "", "release from this branch")
+	fs.BoolVar(&opts.Edit, "edit", false, "open the rendered changelog section in $EDITOR")
 	fs.BoolVar(&opts.Yes, "yes", false, "skip the confirmation prompt")
 	fs.BoolVar(&opts.Yes, "y", false, "skip the confirmation prompt")
 	if pre {
@@ -404,6 +429,17 @@ func cmdRelease(args []string, pre bool) error {
 			ui.Note("Aborted. Nothing was changed.")
 			return errQuiet
 		}
+	}
+
+	if opts.Edit {
+		if !ui.Interactive() {
+			return fmt.Errorf("--edit needs a terminal; drop it, or note the entries with `stamp note` first")
+		}
+		section, err := editSection(plan.Section)
+		if err != nil {
+			return err
+		}
+		plan.Section = section
 	}
 
 	ui.Blank()
@@ -737,6 +773,175 @@ func cmdSet(args []string) error {
 		ui.Step("%s → %s", src.Describe(), next)
 	}
 	return nil
+}
+
+// cmdNote records one user-facing change as a fragment under the changelog
+// directory.
+//
+// It works whether or not the changelog was ever configured: running it is
+// precisely what turns the feature on, because the directory it creates is what
+// ChangelogEnabled looks for.
+func cmdNote(args []string) error {
+	fs := flag.NewFlagSet("note", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, repo, err := load()
+	if err != nil {
+		return err
+	}
+	comp, rest, err := selectComponent(cfg, fs.Args())
+	if err != nil {
+		return err
+	}
+	if len(rest) == 0 {
+		return fmt.Errorf("usage: %s", noteUsage(cfg))
+	}
+	kind, err := changelog.ParseKind(rest[0])
+	if err != nil {
+		// ParseKind's message already lists every kind, which is the only
+		// thing worth saying to somebody who mistyped one.
+		return err
+	}
+
+	// The rest of the line is the text, joined rather than required to be one
+	// argument, so `stamp note added Fixed the thing` works unquoted and the
+	// quoted form works too.
+	text := strings.TrimSpace(strings.Join(rest[1:], " "))
+	if text == "" {
+		if !ui.Interactive() {
+			return fmt.Errorf("usage: %s", noteUsage(cfg))
+		}
+		text = strings.TrimSpace(ui.Ask("What changed, as a user would read it?", ""))
+		if text == "" {
+			return fmt.Errorf("usage: %s", noteUsage(cfg))
+		}
+	}
+
+	dir := orElse(comp.Changelog.Dir, config.DefaultChangelogDir)
+	path, err := changelog.Write(repo.Root, filepath.Join(repo.Root, filepath.FromSlash(dir)), comp.Name, kind, text)
+	if err != nil {
+		return err
+	}
+
+	ui.Blank()
+	ui.Step("Wrote %s", path)
+	ui.Blank()
+	if cfg.Multi {
+		ui.Field("Component", comp.Name)
+	}
+	ui.Field("Kind", kind.Heading())
+	ui.Field("Entry", text)
+	ui.Blank()
+	ui.Note("Commit it with the change it describes. The next release renders it")
+	ui.Note("into the changelog and into the tag, then deletes the file.")
+	return nil
+}
+
+// noteUsage lists the kinds, because a mistyped one is the usual reason this
+// line is being read.
+func noteUsage(cfg *config.Config) string {
+	component := ""
+	if cfg.Multi {
+		component = "<" + strings.Join(cfg.Names(), "|") + "> "
+	}
+	kinds := make([]string, 0, len(changelog.Kinds()))
+	for _, k := range changelog.Kinds() {
+		kinds = append(kinds, string(k))
+	}
+	return fmt.Sprintf("stamp note %s<%s> <text>", component, strings.Join(kinds, "|"))
+}
+
+// cmdChangelog prints the section the next release would write, under an
+// "Unreleased" heading.
+//
+// The section goes to stdout and everything else to stderr, so the command
+// pipes: `stamp changelog > notes.md` gets the markdown and nothing else. It
+// exits 0 even with nothing to show; "no notes yet" is a state, not a failure.
+func cmdChangelog(args []string) error {
+	fs := flag.NewFlagSet("changelog", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, repo, err := load()
+	if err != nil {
+		return err
+	}
+	comp, rest, err := selectComponent(cfg, fs.Args())
+	if err != nil {
+		return err
+	}
+	if len(rest) != 0 {
+		return fmt.Errorf("usage: stamp changelog [component]")
+	}
+
+	entries, from, since, err := release.Notes(comp, repo)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		ui.Hint("Nothing noted yet, and nothing to draft from the commits.")
+		ui.Hint(`Record a change with: stamp note added "…"`)
+		return nil
+	}
+	if from == release.FromCommits {
+		ui.Hint("These are drafts from the commits since %s, not entries anybody wrote.", orElse(since, "the first commit"))
+		ui.Hint(`Note the real ones with: stamp note added "…"`)
+	}
+
+	// Rendered through the same code a release uses, so what this prints is
+	// what the release would write. Only the heading differs: there is no
+	// version to name yet and no date to stamp it with, so the rendered one is
+	// stripped back off and replaced.
+	section := changelog.Render("unreleased", time.Now(), entries)
+	fmt.Fprintf(os.Stdout, "## Unreleased\n\n%s", changelog.Body(section))
+	return nil
+}
+
+// editSection opens the rendered changelog section in the user's editor and
+// returns what came back.
+//
+// An emptied file is honoured rather than treated as a slip: deleting
+// everything is how a user says this release publishes no notes, and second
+// guessing that would mean the only way out is to abort the release.
+func editSection(section string) (string, error) {
+	editor := orElse(os.Getenv("VISUAL"), os.Getenv("EDITOR"))
+	if editor == "" {
+		return "", fmt.Errorf("--edit needs an editor; set $VISUAL or $EDITOR")
+	}
+
+	f, err := os.CreateTemp("", "stamp-changelog-*.md")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	defer os.Remove(path)
+	if _, err := f.WriteString(section); err != nil {
+		f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+
+	// The editor is a command line, not a program name, so EDITOR="code -w"
+	// works the way it does everywhere else.
+	fields := strings.Fields(editor)
+	cmd := exec.Command(fields[0], append(fields[1:], path)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("running %s: %w", editor, err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	edited := strings.TrimSpace(string(data))
+	if edited == "" {
+		return "", nil
+	}
+	return edited + "\n", nil
 }
 
 func cmdCurrent(args []string) error {

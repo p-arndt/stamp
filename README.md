@@ -13,7 +13,7 @@ commits, tags, and pushes branch and tag together. The tag triggers your pipelin
 [![Platforms](https://img.shields.io/badge/platforms-windows%20%7C%20macOS%20%7C%20linux-informational)](#-install)
 [![Zero config](https://img.shields.io/badge/config-optional-success)](#configuration)
 
-[Supported](#what-it-supports) · [Install](#-install) · [Quickstart](#-quickstart) · [Commands](#-commands) · [Pre-releases](#pre-releases) · [How a release runs](#how-a-release-runs) · [Checks](#checks) · [Configuration](#configuration) · [Components](#-components) · [CI](#the-ci-side)
+[Supported](#what-it-supports) · [Install](#-install) · [Quickstart](#-quickstart) · [Commands](#-commands) · [Pre-releases](#pre-releases) · [Changelog](#-changelog) · [How a release runs](#how-a-release-runs) · [Checks](#checks) · [Configuration](#configuration) · [Components](#-components) · [CI](#the-ci-side)
 
 </div>
 
@@ -38,6 +38,7 @@ source of truth, `package.json` follows it, and both are bumped in one commit. B
 | **Version formats** | Strict semver, including pre-releases (`1.0.0-beta.1`) and build metadata |
 | **Bumps** | `patch` · `minor` · `major` · `final` · any explicit version |
 | **Pre-releases** | `stamp prerelease minor` opens a `beta` series; a bare `stamp prerelease` walks it: `-beta.1`, `-beta.2`, … |
+| **Changelog** | Entries written by hand as one file per change, rendered into `CHANGELOG.md` and the tag message by the release. Off until you use it |
 | **Tag styles** | `v0.5.0`, `0.5.0`, `web-v0.5.0`, or whatever your template renders |
 | **Detected without config** | `VERSION` file · `package.json`. `stamp init` looks wider, see [Configuration](#configuration) |
 | **File formatting** | Preserved byte for byte apart from the version literal. Tabs stay tabs, key order stays put, comments survive, the diff is one line |
@@ -122,6 +123,8 @@ versioned packages is what [Components](#-components) is for.
 | `stamp release [component] <patch\|minor\|major\|final\|x.y.z>` | The whole release: resolve, check, write, commit, tag, push. `final` promotes a pre-release to the release it was for, dropping the pre-release and bumping nothing. |
 | `stamp prerelease [component] [patch\|minor\|major]` | The same, cut as a pre-release: `1.2.3` → `1.3.0-beta.1`. Bare, it cuts the next candidate of the series already running. Abbreviates to `stamp pre`. |
 | `stamp set [component] <patch\|minor\|major\|final\|x.y.z>` | Write the version files only, no git. May also go backwards. It is the correction command. |
+| `stamp note [component] <added\|changed\|deprecated\|removed\|fixed\|security> <text>` | Record one user-facing change as a file under `.stamp/changelog`, to be committed with the branch that made it. The next release renders it into the changelog. |
+| `stamp changelog [component]` | Print the entries noted since the last release, rendered as the section a release would write. |
 | `stamp current [component]` | Print the current version bare on stdout, for scripts and justfiles. |
 | `stamp verify [component] --tag <tag>` | CI-side: does this tag match the committed version? Non-zero if not. Without a component it works one out from the tag, and the tag may also be given bare: `stamp verify v0.5.0`. |
 | `stamp migrate` | Rewrite an older `.stamp.yml` in the current shape. `--dry-run` prints it instead. |
@@ -146,6 +149,7 @@ The component is named only in a repository whose `.stamp.yml` declares one, see
 | `--no-push` | Write, commit and tag locally; print the push command for later. |
 | `--no-fetch` | Skip the network checks. Useful offline; the remote state is then unverified. |
 | `--branch <name>` | Release from this branch instead of the configured one. |
+| `--edit` | Open the rendered changelog section in `$EDITOR` before it is committed. |
 | `-y`, `--yes` | Skip the confirmation prompt. Required in a non-interactive shell, because stamp never releases on an unanswered prompt. |
 | `--type <id>` | `prerelease` only: the identifier of the series: `beta`, `rc`, `alpha`, anything semver accepts. |
 
@@ -171,11 +175,36 @@ numbers as `npm version preminor` and `uv version --bump minor --bump beta`.
 Off a stable version it errors. A bump starts a new series at `release.prerelease`, default
 `beta`. Every step is a normal release, tagged `v1.3.0-beta.1`.
 
+## 📝 Changelog
+
+A commit says how the code changed. A changelog says what the release means for the people
+using it, and no amount of grouping turns one into the other. So the entry is written by
+hand, by whoever made the change, as one file per change:
+
+```console
+$ stamp note added "Pre-releases: stamp prerelease minor opens a beta series"
+Wrote .stamp/changelog/pre-releases-stamp-prerelease-minor-opens.added.md
+```
+
+The name carries the kind, the body carries the prose. It is committed with the feature
+branch, so it turns up in the pull request diff, and one file per change means two branches
+never conflict over the changelog.
+
+| | |
+| --- | --- |
+| **Kinds** | The [Keep a Changelog](https://keepachangelog.com) six: `added` · `changed` · `deprecated` · `removed` · `fixed` · `security` |
+| **Preview** | `stamp changelog` renders what has piled up, as the section a release would write |
+| **On release** | Fragments rendered into `CHANGELOG.md` and deleted, in the same commit as the version bump |
+| **Handoff** | That section is the annotated tag's message, so the pipeline generates nothing: `git tag -l --format='%(contents:body)' "$TAG"` |
+| **`--edit`** | Opens the rendered section in `$EDITOR` before it is committed |
+| **Nothing noted** | Drafted from the conventional commits since the last tag. `fallback: none` leaves it empty, `require: true` fails the preflight instead |
+| **Off until used** | No `stamp note`, no `CHANGELOG.md`, no `changelog:` block: the release runs exactly as it did before, and the check is skipped |
+
 ## How a release runs
 
 ```mermaid
 flowchart LR
-    START(["stamp release minor"]) --> PF{"Preflight"} --> ASK{"Confirm"} --> WRITE["Write<br/>VERSION + mirrors"] --> COMMIT["Commit"] --> TAG["Annotated tag"] --> PUSH["One push<br/>branch + tag"] --> CI(["Pipeline runs"])
+    START(["stamp release minor"]) --> PF{"Preflight"} --> ASK{"Confirm"} --> WRITE["Write<br/>VERSION + mirrors"] --> CL["Render<br/>CHANGELOG.md"] --> COMMIT["Commit"] --> TAG["Annotated tag<br/>notes in the message"] --> PUSH["One push<br/>branch + tag"] --> CI(["Pipeline runs"])
 
     PF -. "a check fails" .-> NOTHING["Nothing written"]
     ASK -. "n" .-> NOTHING
@@ -190,7 +219,7 @@ flowchart LR
     classDef bad fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
     classDef warn fill:#fef3c7,stroke:#d97706,color:#78350f
     class START,CI done
-    class WRITE,COMMIT,TAG,PUSH step
+    class WRITE,CL,COMMIT,TAG,PUSH step
     class PF,ASK gate
     class NOTHING,UNDO bad
     class KEEP warn
@@ -220,9 +249,11 @@ next to the retry, and lets you pick.
 | Working tree clean | Untracked files included, so "clean" means what `git status` means. The release commit must hold only the version bump. |
 | Not behind the remote | Otherwise the tag names an already-outdated commit. Needs a `git fetch`, and a remote it cannot reach fails the check rather than being waved through; skip both with `--no-fetch`. |
 | Tag does not exist | Locally and on the remote. Reusing a tag silently changes what a published version means. |
+| The release has changelog entries | A release nobody described is a release nobody can read about. Forcing it on every repository would make stamp fail for reasons that are not about correctness, so it only fails under `changelog.require: true`. |
 
-Reported with `-` rather than failing: a branch with no upstream, and the up-to-date check
-under `--no-fetch`, which also drops the remote half of the tag check.
+Reported with `-` rather than failing: a branch with no upstream, the up-to-date check
+under `--no-fetch`, which also drops the remote half of the tag check, and the changelog
+check where the changelog is not in use or nothing was noted.
 
 **Tests are not stamp's job.** There is no `checks:` block and no `--check` flag.
 
@@ -270,6 +301,7 @@ stamp runs without a config. `.stamp.yml` is for when a default is wrong:
 | Commit | `release: {{ tag }}` |
 | Push | yes |
 | Pre-release identifier | `beta` |
+| Changelog | `CHANGELOG.md`, from fragments in `.stamp/changelog`, written only once something is noted |
 
 `stamp init` writes one for you, every default spelled out so you can edit it:
 
@@ -354,6 +386,13 @@ release:
   commit: "release: {{ tag }}"
   push: true
   prerelease: beta              # identifier for `stamp prerelease`; --type overrides it
+
+changelog:
+  file: CHANGELOG.md            # the rendered file; "" writes no file
+  dir: .stamp/changelog         # where the fragments are collected
+  fallback: commits             # commits | none: what an empty release falls back to
+  require: false                # true fails preflight when nothing was noted
+  tag_body: true                # render the section into the annotated tag message
 ```
 
 A Node project, where `package.json` *is* the source of truth:
@@ -365,6 +404,9 @@ version: package.json#version
 `tag` takes `{{ version }}`, `commit` also `{{ tag }}`, both `{{ component }}` where
 components are declared. A typo, a tag without `{{ version }}`, or an unknown key is a
 config error.
+
+Every `changelog:` key shown is its default, so the block is only worth writing to turn
+something off: `file: ""` renders into the tag alone, `tag_body: false` leaves the tag bare.
 
 ### Coming from an older config
 
@@ -415,7 +457,18 @@ $ stamp verify --tag web-v1.2.0
 ```
 
 A component inherits every key under `release:` and overrides only the ones it names, key
-by key. Without a component name stamp refuses to guess:
+by key. A `changelog:` block inside a component works the same way, so each unit can keep
+its own `CHANGELOG.md` and its own fragment directory:
+
+```yaml
+  web:
+    version: web/package.json#version
+    changelog:
+      file: web/CHANGELOG.md
+      dir: web/.stamp/changelog
+```
+
+Without a component name stamp refuses to guess:
 
 ```console
 $ stamp release minor
@@ -426,8 +479,9 @@ error: this repository has components (cli, web): name one, e.g. `stamp release 
 `stamp verify` is the exception: it works the component out from the tag, which is all a
 CI job knows.
 
-Caught at load: one file listed by two components, and two components rendering the same
-tag. A repository versioning a single thing writes no `components:` block at all.
+Caught at load: one file listed by two components, two components rendering the same tag,
+and two components rendering into the same changelog file. A repository versioning a single
+thing writes no `components:` block at all.
 
 ## The CI side
 
@@ -435,14 +489,14 @@ tag. A repository versioning a single thing writes no `components:` block at all
 flowchart LR
     subgraph LOCAL["stamp: the controller"]
         direction TB
-        V["set the version"] --> C["check"] --> K["commit"] --> T["tag"] --> P["push"]
+        V["set the version"] --> C["check"] --> N["render the changelog"] --> K["commit"] --> T["tag"] --> P["push"]
     end
 
-    HANDOFF{{"tag v0.5.0"}}
+    HANDOFF{{"tag v0.5.0<br/>notes in its message"}}
 
     subgraph REMOTE["GitHub Action: the worker"]
         direction TB
-        VER["validate the tag"] --> TEST["test"] --> X["cross-compile"] --> A["archives + checksums"] --> REL["changelog + release"]
+        VER["validate the tag"] --> TEST["test"] --> X["cross-compile"] --> A["archives + checksums"] --> REL["read the notes<br/>publish the release"]
     end
 
     P ==> HANDOFF ==> VER
@@ -450,7 +504,7 @@ flowchart LR
     classDef local fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
     classDef remote fill:#f3e8ff,stroke:#9333ea,color:#4c1d95
     classDef hand fill:#dcfce7,stroke:#16a34a,color:#14532d
-    class V,C,K,T,P local
+    class V,C,N,K,T,P local
     class VER,TEST,X,A,REL remote
     class HANDOFF hand
     style LOCAL fill:#f8fafc,stroke:#cbd5e1,color:#334155
@@ -477,3 +531,18 @@ jobs:
 `verify` compares *forwards*: it renders the tag from the committed version rather than
 stripping a prefix off the tag, checks every version location, and identifies the component
 the same way. [release.yml](.github/workflows/release.yml) is a working example.
+
+It also never decides what the release says. The notes were written before the tag existed,
+so publishing is one read:
+
+```yaml
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - run: git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > RELEASE_NOTES.md
+```
+
+A tag with an empty body, an older one or one from a repository not using the changelog,
+still publishes; give it a line pointing at the commit history rather than an empty release
+page.

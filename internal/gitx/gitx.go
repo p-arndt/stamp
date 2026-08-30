@@ -160,8 +160,13 @@ func (r *Repo) Commit(message string) error {
 }
 
 // Tag creates an annotated tag on HEAD.
+//
+// --cleanup=verbatim because the message may carry a rendered changelog
+// section, and git's default cleanup strips every line that starts with "#",
+// which would silently swallow the "### Added" headings a pipeline reads the
+// release notes out of.
 func (r *Repo) Tag(tag, message string) error {
-	_, err := r.git("tag", "-a", tag, "-m", message)
+	_, err := r.git("tag", "-a", "--cleanup=verbatim", tag, "-m", message)
 	return err
 }
 
@@ -206,6 +211,63 @@ func (r *Repo) DefaultRemote() (string, error) {
 // ShortHEAD returns the abbreviated commit hash of HEAD.
 func (r *Repo) ShortHEAD() (string, error) {
 	return r.git("rev-parse", "--short", "HEAD")
+}
+
+// LastTag returns the most recent tag reachable from HEAD that matches pattern,
+// or "" when the repository has none yet.
+//
+// describe rather than `tag --list` because reachability is the point: a tag
+// cut on another branch is not part of this branch's history, and the commits
+// "since the last release" have to be the commits since the last release *of
+// this line of development*. --abbrev=0 asks describe for the bare tag name
+// instead of the tag+distance+hash form, and --match narrows it to this
+// component's tags, so `web-v*` does not pick up `cli-v1.2.0`.
+//
+// describe exits non-zero with "no names found" when nothing matches, which is
+// the ordinary state of a repository before its first release and so is
+// reported as the empty string rather than as an error.
+func (r *Repo) LastTag(pattern string) (string, error) {
+	if !r.HasCommits() {
+		return "", nil
+	}
+	args := []string{"describe", "--tags", "--abbrev=0"}
+	if pattern != "" {
+		args = append(args, "--match", pattern)
+	}
+	out, err := r.git(args...)
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return "", nil // No tag matches; the whole history is "since".
+		}
+		return "", err
+	}
+	return out, nil
+}
+
+// Subjects returns the subject line of every commit after rev, oldest first. An
+// empty rev means the whole history.
+//
+// --reverse puts the oldest first, which is the order a changelog reads in.
+// --no-merges leaves out the merge commits, whose subjects describe the branch
+// rather than the change. The range is "rev..HEAD", so the commit rev points at
+// (the last release) is excluded, which is what "since the last tag" means.
+func (r *Repo) Subjects(rev string) ([]string, error) {
+	if !r.HasCommits() {
+		return nil, nil
+	}
+	args := []string{"log", "--reverse", "--no-merges", "--format=%s"}
+	if rev != "" {
+		args = append(args, rev+"..HEAD")
+	}
+	out, err := r.git(args...)
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
 }
 
 // HasCommits reports whether HEAD resolves, i.e. the repository is not empty.

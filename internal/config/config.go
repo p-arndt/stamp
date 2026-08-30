@@ -36,6 +36,16 @@ const (
 	DefaultCommit  = "release: {{tag}}"
 	DefaultVersion = "VERSION"
 	DefaultPackage = "package.json"
+
+	DefaultChangelogFile     = "CHANGELOG.md"
+	DefaultChangelogDir      = ".stamp/changelog"
+	DefaultChangelogFallback = "commits"
+)
+
+// Fallback values `changelog.fallback` accepts.
+const (
+	FallbackCommits = "commits"
+	FallbackNone    = "none"
 )
 
 // Config is the resolved release configuration: what the file said, filled in
@@ -75,6 +85,44 @@ type Component struct {
 	Push           bool
 	// PreID is the default pre-release identifier for `stamp prerelease`.
 	PreID string
+	// Changelog is this component's news-fragment configuration.
+	Changelog Changelog
+}
+
+// Changelog is where this component's changelog entries are collected and
+// where the rendered file lives.
+type Changelog struct {
+	// File is the repository-relative changelog file. Empty means stamp
+	// renders no file and only carries the entries into the tag.
+	File string
+	// Dir is the repository-relative directory the fragments are written to.
+	Dir string
+	// Fallback names what a release without fragments falls back to:
+	// "commits" drafts entries from the conventional commits since the last
+	// tag, "none" leaves the section empty.
+	Fallback string
+	// Require makes an empty changelog a failed preflight check.
+	Require bool
+	// TagBody puts the rendered section into the annotated tag message.
+	TagBody bool
+	// Declared records that a changelog: block named any of this, which is
+	// what makes the feature opt-in: see Component.ChangelogEnabled.
+	Declared bool
+}
+
+// ChangelogEnabled reports whether this release should touch the changelog at
+// all. The feature is opt-in by use rather than by a flag: a repository that
+// has never run `stamp note`, has no changelog file and says nothing about one
+// in its config releases exactly as it did before the feature existed.
+// root is the absolute repository root.
+func (c *Component) ChangelogEnabled(root string) bool {
+	if c.Changelog.Declared {
+		return true
+	}
+	if c.Changelog.Dir != "" && isDir(filepath.Join(root, filepath.FromSlash(c.Changelog.Dir))) {
+		return true
+	}
+	return c.Changelog.File != "" && exists(filepath.Join(root, filepath.FromSlash(c.Changelog.File)))
 }
 
 // Source is the authoritative version location.
@@ -175,6 +223,13 @@ func baseComponent(project string) *Component {
 		CommitTemplate: DefaultCommit,
 		Push:           true,
 		PreID:          version.DefaultPreID,
+		Changelog: Changelog{
+			File:     DefaultChangelogFile,
+			Dir:      DefaultChangelogDir,
+			Fallback: DefaultChangelogFallback,
+			Require:  false,
+			TagBody:  true,
+		},
 	}
 }
 
@@ -195,7 +250,7 @@ func parse(root string, raw []byte) (*Config, error) {
 		return nil, fmt.Errorf("%s is empty, delete it or run `stamp init`", FileName)
 	}
 	top := doc.Content[0]
-	if err := strictKeys(top, "top level", "project", "version", "release", "components"); err != nil {
+	if err := strictKeys(top, "top level", "project", "version", "release", "changelog", "components"); err != nil {
 		return nil, err
 	}
 
@@ -216,6 +271,13 @@ func parse(root string, raw []byte) (*Config, error) {
 			return nil, err
 		}
 		spec, err := parseRelease(n, "release")
+		if err != nil {
+			return nil, err
+		}
+		spec.applyTo(base)
+	}
+	if n := field(top, "changelog"); n != nil {
+		spec, err := parseChangelog(n, "changelog")
 		if err != nil {
 			return nil, err
 		}
@@ -433,6 +495,98 @@ func (r releaseSpec) applyTo(c *Component) {
 	}
 }
 
+// changelogSpec is the set of changelog keys, as written in `changelog:` or
+// inside a component. Every field is a pointer or an empty string so "not
+// written" stays distinguishable from "written as the default", which is what
+// makes a component override exactly the keys it names.
+type changelogSpec struct {
+	File     *string `yaml:"file"`
+	Dir      *string `yaml:"dir"`
+	Fallback string  `yaml:"fallback"`
+	Require  *bool   `yaml:"require"`
+	TagBody  *bool   `yaml:"tag_body"`
+}
+
+// changelogKeys are the keys `changelog:` accepts, at the top level and inside
+// a component.
+var changelogKeys = []string{"file", "dir", "fallback", "require", "tag_body"}
+
+// parseChangelog reads the `changelog:` mapping, rejecting the values that
+// cannot mean anything before they reach a release.
+func parseChangelog(n *yaml.Node, where string) (changelogSpec, error) {
+	var spec changelogSpec
+	if n.Kind != yaml.MappingNode {
+		return spec, fmt.Errorf("%s:%d: %s must be a mapping", FileName, n.Line, where)
+	}
+	if err := strictKeys(n, where, changelogKeys...); err != nil {
+		return spec, err
+	}
+	if err := n.Decode(&spec); err != nil {
+		return spec, fmt.Errorf("%s:%d: %s: %w", FileName, n.Line, where, err)
+	}
+	if spec.Fallback != "" && spec.Fallback != FallbackCommits && spec.Fallback != FallbackNone {
+		return spec, fmt.Errorf("%s:%d: %s.fallback is %q; it must be %q or %q",
+			FileName, n.Line, where, spec.Fallback, FallbackCommits, FallbackNone)
+	}
+	// An empty file: is legal and means "render no file"; an empty dir: is not,
+	// because the fragments would then land in the repository root.
+	if spec.File != nil && *spec.File != "" {
+		if err := checkInsideRepo(*spec.File, where+".file", n.Line); err != nil {
+			return spec, err
+		}
+	}
+	if spec.Dir != nil {
+		if *spec.Dir == "" {
+			return spec, fmt.Errorf("%s:%d: %s.dir is empty; name the directory the changelog entries are collected in", FileName, n.Line, where)
+		}
+		if err := checkInsideRepo(*spec.Dir, where+".dir", n.Line); err != nil {
+			return spec, err
+		}
+	}
+	return spec, nil
+}
+
+// checkInsideRepo rejects any path that could resolve outside the repository.
+// Both the unix and the Windows form of an absolute path are rejected on every
+// platform, because a config file travels between machines.
+func checkInsideRepo(path, where string, line int) error {
+	bad := func(why string) error {
+		return fmt.Errorf("%s:%d: %s is %q, which %s; it must be relative to the repository root",
+			FileName, line, where, path, why)
+	}
+	if filepath.IsAbs(path) || strings.HasPrefix(path, "/") || strings.HasPrefix(path, `\`) {
+		return bad("is absolute")
+	}
+	if len(path) >= 2 && path[1] == ':' {
+		return bad("names a drive")
+	}
+	for _, segment := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if segment == ".." {
+			return bad(`walks up out of the repository ("..")`)
+		}
+	}
+	return nil
+}
+
+func (s changelogSpec) applyTo(c *Component) {
+	c.Changelog.Declared = true
+	if s.File != nil {
+		c.Changelog.File = *s.File
+	}
+	if s.Dir != nil {
+		c.Changelog.Dir = *s.Dir
+	}
+	if s.Fallback != "" {
+		c.Changelog.Fallback = s.Fallback
+	}
+	if s.Require != nil {
+		c.Changelog.Require = *s.Require
+	}
+	if s.TagBody != nil {
+		c.Changelog.TagBody = *s.TagBody
+	}
+}
+
 // parseComponents reads the `components:` mapping, each entry inheriting base.
 func parseComponents(root string, n *yaml.Node, base *Component) ([]*Component, error) {
 	if n.Kind != yaml.MappingNode {
@@ -459,7 +613,7 @@ func parseComponents(root string, n *yaml.Node, base *Component) ([]*Component, 
 		if valNode.Kind != yaml.MappingNode {
 			return nil, fmt.Errorf("%s:%d: %s must be a mapping", FileName, valNode.Line, where)
 		}
-		if err := strictKeys(valNode, where, append([]string{"version"}, releaseKeys...)...); err != nil {
+		if err := strictKeys(valNode, where, append([]string{"version", "changelog"}, releaseKeys...)...); err != nil {
 			return nil, err
 		}
 
@@ -470,6 +624,14 @@ func parseComponents(root string, n *yaml.Node, base *Component) ([]*Component, 
 			return nil, err
 		}
 		spec.applyTo(&comp)
+
+		if cn := field(valNode, "changelog"); cn != nil {
+			clSpec, err := parseChangelog(cn, where+".changelog")
+			if err != nil {
+				return nil, err
+			}
+			clSpec.applyTo(&comp)
+		}
 
 		versionNode := field(valNode, "version")
 		if versionNode == nil {
@@ -541,6 +703,7 @@ func validate(cfg *Config) error {
 
 	owner := map[string]string{}
 	tags := map[string]string{}
+	changelogs := map[string]string{}
 	for _, comp := range cfg.Components {
 		where := "release"
 		if comp.Name != "" {
@@ -563,6 +726,18 @@ func validate(cfg *Config) error {
 
 		if !cfg.Multi {
 			continue
+		}
+		// Two components rendering into one changelog file would overwrite each
+		// other's section. Sharing a fragment directory is fine: the fragments
+		// live in a per-component subdirectory of it. Only a declared changelog
+		// is checked: components that never mention one carry the same default
+		// file, and the feature stays off for them anyway.
+		if file := comp.Changelog.File; file != "" && comp.Changelog.Declared {
+			if other, taken := changelogs[file]; taken {
+				return fmt.Errorf("%s: %s and %s would both render into %s: give each component its own changelog file",
+					FileName, other, comp.Name, file)
+			}
+			changelogs[file] = comp.Name
 		}
 		// Two components whose tag templates come out identical would always
 		// want the same tag, and that is only ever found out at the second
@@ -692,4 +867,9 @@ func contains(list []string, s string) bool {
 func exists(path string) bool {
 	st, err := os.Stat(path)
 	return err == nil && !st.IsDir()
+}
+
+func isDir(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.IsDir()
 }

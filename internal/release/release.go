@@ -12,7 +12,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
+	"github.com/p-arndt/stamp/internal/changelog"
 	"github.com/p-arndt/stamp/internal/config"
 	"github.com/p-arndt/stamp/internal/gitx"
 	"github.com/p-arndt/stamp/internal/ui"
@@ -39,6 +42,9 @@ type Options struct {
 	Pre bool
 	// PreID overrides the configured pre-release identifier for this run.
 	PreID string
+	// Edit opens the rendered changelog section in an editor before it is
+	// committed.
+	Edit bool
 }
 
 // Plan is everything stamp resolved before touching the repository.
@@ -59,11 +65,31 @@ type Plan struct {
 
 	// Unchanged is true when the version files already hold the target
 	// version. That is the first-release case: there is nothing to write and
-	// nothing to commit, so stamp tags the current HEAD.
+	// nothing to commit, so stamp tags the current HEAD. A changelog section
+	// can still exist, and is still written and committed.
 	Unchanged bool
+
+	// Notes are the changelog entries this release publishes, empty when the
+	// changelog is not in use.
+	Notes []changelog.Entry
+	// NotesFrom says where Notes came from: "fragments", "commits", or "".
+	NotesFrom string
+	// Section is the rendered changelog section, empty when there is nothing
+	// to say. `--edit` replaces it between Prepare and Run.
+	Section string
+
+	// notesSince is the tag the drafted entries were taken since, for the
+	// preflight detail. It is empty unless NotesFrom is FromCommits.
+	notesSince string
 
 	checks []check
 }
+
+// Where Notes came from, as reported by NotesFrom.
+const (
+	FromFragments = "fragments"
+	FromCommits   = "commits"
+)
 
 type check struct {
 	label   string
@@ -97,6 +123,19 @@ func Prepare(cfg *config.Config, comp *config.Component, repo *gitx.Repo, opts O
 	}
 	p.Branch = wantBranch
 
+	// The changelog is resolved before preflight, because one of the checks is
+	// about what it found. A fragment that will not read is a hard error rather
+	// than a failed check: it means a note somebody wrote would be dropped, and
+	// no amount of "release anyway" is the right answer to that.
+	if comp.ChangelogEnabled(repo.Root) {
+		notes, from, since, err := Notes(comp, repo)
+		if err != nil {
+			return nil, err
+		}
+		p.Notes, p.NotesFrom, p.notesSince = notes, from, since
+		p.Section = changelog.Render(next, time.Now(), notes)
+	}
+
 	if err := p.preflight(); err != nil {
 		return p, err
 	}
@@ -127,6 +166,95 @@ func resolve(comp *config.Component, opts Options, current string) (string, erro
 	return version.ResolvePre(current, opts.Arg, id)
 }
 
+// Notes collects the changelog entries a release of comp would publish right
+// now: the fragments noted since the last release, or, when there are none and
+// the component's fallback allows it, drafts from the commits since its last
+// tag. from is FromFragments, FromCommits or "" and since names the tag the
+// drafts were taken after, for the output that has to tell a user which of the
+// two they are looking at.
+//
+// It is exported because `stamp changelog` shows exactly what a release would
+// publish, and the only way to promise that is to run the same code.
+func Notes(comp *config.Component, repo *gitx.Repo) (entries []changelog.Entry, from, since string, err error) {
+	if dir := comp.Changelog.Dir; dir != "" {
+		abs := filepath.Join(repo.Root, filepath.FromSlash(dir))
+		entries, err = changelog.Read(repo.Root, abs, comp.Name)
+		if err != nil {
+			return nil, "", "", err
+		}
+	}
+	if len(entries) > 0 {
+		return entries, FromFragments, "", nil
+	}
+	if comp.Changelog.Fallback != config.FallbackCommits {
+		return nil, "", "", nil
+	}
+	// The fallback is a convenience, not a promise: a repository whose history
+	// cannot be walked (a shallow CI clone, a broken describe) simply gets no
+	// drafts rather than a failed release.
+	last, err := repo.LastTag(comp.RenderTag("*"))
+	if err != nil {
+		return nil, "", "", nil
+	}
+	subjects, err := repo.Subjects(last)
+	if err != nil {
+		return nil, "", "", nil
+	}
+	drafted := changelog.FromCommits(subjects)
+	if len(drafted) == 0 {
+		return nil, "", "", nil
+	}
+	return drafted, FromCommits, last, nil
+}
+
+// writesChangelog reports whether this run renders a changelog file. An empty
+// section means there is nothing to say, and an empty file means the component
+// carries its entries into the tag only.
+func (p *Plan) writesChangelog() bool {
+	return p.Section != "" && p.Comp.Changelog.File != ""
+}
+
+// changelogCheck is the preflight check for what the release has to say about
+// itself. It fails only under changelog.require: a release stamp cannot
+// describe is still a correct release, and failing every repository over it
+// would make the check the reason people stop reading the check list.
+func (p *Plan) changelogCheck() {
+	const label = "the release has changelog entries"
+	cl := p.Comp.Changelog
+	switch {
+	case !p.Comp.ChangelogEnabled(p.Repo.Root):
+		p.add(check{label: label, skipped: true,
+			detail: "the changelog is not in use; `stamp note added \"…\"` starts it"})
+	case len(p.Notes) == 0 && cl.Require:
+		p.add(check{label: label, ok: false,
+			detail: fmt.Sprintf("nothing noted; run `stamp note added \"…\"`, or set changelog.require to false in %s", config.FileName)})
+	case len(p.Notes) == 0:
+		p.add(check{label: label, skipped: true, detail: "nothing noted, the release section stays empty"})
+	case p.NotesFrom == FromCommits:
+		// A passing check prints its label and nothing else, so what the
+		// entries are and where they came from has to be in the label.
+		p.add(check{ok: true, label: fmt.Sprintf("the release has %s drafted from commits since %s",
+			plural(len(p.Notes)), orElse(p.notesSince, "the first commit"))})
+	default:
+		p.add(check{ok: true, label: fmt.Sprintf("the release has %s from %s",
+			plural(len(p.Notes)), cl.Dir)})
+	}
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return "1 entry"
+	}
+	return fmt.Sprintf("%d entries", n)
+}
+
+func orElse(v, fallback string) string {
+	if v != "" {
+		return v
+	}
+	return fallback
+}
+
 // preflight fills p.checks. It returns an error only for problems that make the
 // plan itself unresolvable; a failed check is reported through p.checks so the
 // user sees all of them at once instead of fixing them one per run.
@@ -139,7 +267,12 @@ func (p *Plan) preflight() error {
 	} else {
 		p.Unchanged = equal
 		label := fmt.Sprintf("%s is newer than %s", p.Next, p.Current)
-		if equal {
+		switch {
+		case equal && p.writesChangelog():
+			// The version files need no write, but the changelog does, and
+			// that write still has to be committed.
+			label = fmt.Sprintf("version already at %s, committing the changelog and tagging HEAD", p.Next)
+		case equal:
 			label = fmt.Sprintf("version already at %s, tagging HEAD, no commit", p.Next)
 		}
 		p.add(check{label: label, ok: true})
@@ -216,6 +349,8 @@ func (p *Plan) preflight() error {
 				detail: fmt.Sprintf("%s already exists on %s", p.Tag, p.Remote)})
 		}
 	}
+
+	p.changelogCheck()
 	return nil
 }
 
@@ -278,7 +413,7 @@ func (p *Plan) Print() {
 	if pre := version.PreOf(p.Next); pre != "" {
 		ui.Field("Pre-release", fmt.Sprintf("%s (not a stable release)", pre))
 	}
-	if !p.Unchanged {
+	if !p.Unchanged || p.writesChangelog() {
 		ui.Field("Commit", p.Commit)
 	}
 	ui.Field("Tag", p.Tag)
@@ -292,12 +427,19 @@ func (p *Plan) Print() {
 		ui.Field("Config", fmt.Sprintf("none, detected %s", p.Comp.Source().Describe()))
 	}
 
-	if !p.Unchanged {
+	if !p.Unchanged || p.writesChangelog() {
 		ui.Section("Files to update:")
-		for _, s := range p.Comp.Sources {
-			ui.Item(s.Describe())
+		if !p.Unchanged {
+			for _, s := range p.Comp.Sources {
+				ui.Item(s.Describe())
+			}
+		}
+		if p.writesChangelog() {
+			ui.Item(p.Comp.Changelog.File)
 		}
 	}
+
+	p.printNotes()
 
 	ui.Section("Checks:")
 	for _, c := range p.checks {
@@ -314,12 +456,58 @@ func (p *Plan) Print() {
 	}
 }
 
+// maxListedNotes caps the entries printed in the plan. A release with fifty
+// notes is a real thing, and printing all of them would push the check list,
+// which is what the user is here to read, off the top of the screen.
+const maxListedNotes = 10
+
+// printNotes shows what the release will publish. Drafted entries are labelled
+// as drafts every time they are shown: a user must never mistake a line stamp
+// wrote from a commit subject for a line a human wrote for them.
+func (p *Plan) printNotes() {
+	if len(p.Notes) == 0 {
+		return
+	}
+	ui.Section("Changelog:")
+	if p.NotesFrom == FromCommits {
+		ui.Note("Drafted from the commits since %s, not noted by hand. Review them, or edit with --edit.",
+			orElse(p.notesSince, "the first commit"))
+	}
+	for i, e := range p.Notes {
+		if i == maxListedNotes {
+			ui.Item(fmt.Sprintf("… and %d more", len(p.Notes)-maxListedNotes))
+			break
+		}
+		ui.Item(fmt.Sprintf("%s: %s", e.Kind.Heading(), firstLine(e.Text)))
+	}
+	if !p.writesChangelog() && p.Comp.Changelog.TagBody {
+		ui.Note("No changelog file is configured; the entries go into the tag only.")
+	}
+}
+
+// firstLine keeps a multi-paragraph entry to one line in the plan; the whole of
+// it still goes into the changelog.
+func firstLine(text string) string {
+	line, rest, _ := strings.Cut(strings.TrimSpace(text), "\n")
+	if strings.TrimSpace(rest) != "" {
+		return line + " …"
+	}
+	return line
+}
+
 // snapshot is a file's contents before stamp wrote to it, kept in memory so a
 // failure can put it back.
 type snapshot struct {
 	path string // repository-relative
 	data []byte
 	mode os.FileMode
+	// created is true when stamp created the file, so putting it back means
+	// removing it again. Writing an empty file in its place would leave a
+	// CHANGELOG.md behind that nobody asked for, and, worse, would switch the
+	// changelog on for every later release of a repository that had opted out.
+	created bool
+	// desc says what the restore amounted to, for the "Restored:" list.
+	desc string
 }
 
 // Run executes the plan. It assumes Print and the confirmation already happened.
@@ -335,11 +523,20 @@ func (p *Plan) Run() error {
 		}
 		ui.Step("Restored:")
 		for _, s := range written {
-			if err := os.WriteFile(filepath.Join(p.Repo.Root, s.path), s.data, s.mode); err != nil {
+			abs := filepath.Join(p.Repo.Root, s.path)
+			if s.created {
+				if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+					ui.Errorf("could not remove %s: %v", s.path, err)
+					continue
+				}
+				ui.Item(fmt.Sprintf("%s → removed", s.path))
+				continue
+			}
+			if err := os.WriteFile(abs, s.data, s.mode); err != nil {
 				ui.Errorf("could not restore %s: %v", s.path, err)
 				continue
 			}
-			ui.Item(fmt.Sprintf("%s → %s", s.path, p.Current))
+			ui.Item(fmt.Sprintf("%s → %s", s.path, s.desc))
 		}
 	}
 
@@ -353,28 +550,46 @@ func (p *Plan) Run() error {
 			if err := src.Write(p.Next); err != nil {
 				return fail(fmt.Errorf("writing %s: %w", src.Path(), err), restore, notNothing...)
 			}
-			written = append(written, snapshot{path: src.Path(), data: data, mode: mode})
+			written = append(written, snapshot{path: src.Path(), data: data, mode: mode, desc: p.Current})
 			ui.Step("  updated %s", src.Describe())
 		}
+	}
+
+	// The changelog, after the version files and before the commit, so a
+	// failure anywhere in here is undone by the same restore closure and the
+	// release stops with nothing committed.
+	changelogPaths, err := p.writeChangelog(&written)
+	if err != nil {
+		return fail(err, restore, notNothing...)
 	}
 
 	// Commit. The version files are staged explicitly, never `commit -a`,
 	// so nothing that appeared in the tree meanwhile can slip into the release
 	// commit.
-	committed := false
+	//
+	// The version bump and the changelog go in together: one commit is the
+	// whole release. A first release, whose version files already hold the
+	// target version, still commits when it has a changelog to publish.
+	var paths []string
 	if !p.Unchanged {
-		changed, err := p.Repo.HasChanges(p.Comp.Paths()...)
+		paths = append(paths, p.Comp.Paths()...)
+	}
+	paths = append(paths, changelogPaths...)
+
+	committed := false
+	if len(paths) > 0 {
+		changed, err := p.Repo.HasChanges(paths...)
 		if err != nil {
 			return fail(err, restore, notNothing...)
 		}
 		if changed {
-			if err := p.Repo.Add(p.Comp.Paths()...); err != nil {
+			if err := p.Repo.Add(paths...); err != nil {
 				return fail(err, restore, notNothing...)
 			}
 			if err := p.Repo.Commit(p.Commit); err != nil {
 				// Unstage before restoring, so the index does not keep a
 				// staged version bump that the working tree no longer has.
-				if uerr := p.Repo.Unstage(p.Comp.Paths()...); uerr != nil {
+				if uerr := p.Repo.Unstage(paths...); uerr != nil {
 					ui.Errorf("could not unstage: %v", uerr)
 				}
 				return fail(err, restore, notNothing...)
@@ -387,7 +602,7 @@ func (p *Plan) Run() error {
 	// Tag. A failure here leaves the commit in place: it is a valid commit and
 	// throwing it away would mean rewriting history the user may already be
 	// looking at. Retrying is a single tag command, which we print.
-	if err := p.Repo.Tag(p.Tag, p.Tag); err != nil {
+	if err := p.Repo.Tag(p.Tag, p.tagMessage()); err != nil {
 		ui.Blank()
 		ui.Errorf("creating tag %s failed: %v", p.Tag, err)
 		if committed {
@@ -423,6 +638,89 @@ func (p *Plan) Run() error {
 	}
 	return nil
 }
+
+// writeChangelog renders the section into the changelog file and removes the
+// fragments it came from, appending a snapshot of everything it touched to
+// written so the caller's restore closure can put it all back.
+//
+// It returns the repository-relative paths that have to be staged. A deleted
+// fragment is one of them: `git add` on a path that is gone records the
+// deletion, which is what puts the removal in the release commit.
+//
+// Entries drafted from commits carry no file, so nothing is deleted for them.
+// Directories are left in place even when they end up empty, which is what
+// keeps restoring a plain write.
+func (p *Plan) writeChangelog(written *[]snapshot) ([]string, error) {
+	if !p.writesChangelog() {
+		return nil, nil
+	}
+	rel := filepath.FromSlash(p.Comp.Changelog.File)
+	abs := filepath.Join(p.Repo.Root, rel)
+
+	data, mode, err := readWithMode(abs)
+	created := false
+	if os.IsNotExist(err) {
+		// A missing changelog is the ordinary first time: Insert writes the
+		// file header and the section into it.
+		data, mode, created, err = nil, changelogMode, true, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), dirMode); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(abs, changelog.Insert(data, p.Section), mode); err != nil {
+		return nil, fmt.Errorf("writing %s: %w", p.Comp.Changelog.File, err)
+	}
+	*written = append(*written, snapshot{path: rel, data: data, mode: mode, created: created, desc: "restored"})
+	ui.Step("  updated %s", p.Comp.Changelog.File)
+
+	paths := []string{p.Comp.Changelog.File}
+	removed := 0
+	for _, e := range p.Notes {
+		if e.File == "" {
+			continue
+		}
+		frag := filepath.FromSlash(e.File)
+		fabs := filepath.Join(p.Repo.Root, frag)
+		fdata, fmode, err := readWithMode(fabs)
+		if err != nil {
+			return paths, err
+		}
+		if err := os.Remove(fabs); err != nil {
+			return paths, fmt.Errorf("removing %s: %w", e.File, err)
+		}
+		*written = append(*written, snapshot{path: frag, data: fdata, mode: fmode, desc: "restored"})
+		paths = append(paths, e.File)
+		removed++
+	}
+	if removed > 0 {
+		ui.Step("  collected %s from %s", plural(removed), p.Comp.Changelog.Dir)
+	}
+	return paths, nil
+}
+
+// tagMessage is the annotated tag's message: the tag name, and under it the
+// release notes, so the pipeline can read them straight off the tag instead of
+// generating something else.
+func (p *Plan) tagMessage() string {
+	if !p.Comp.Changelog.TagBody || p.Section == "" {
+		return p.Tag
+	}
+	body := changelog.Body(p.Section)
+	if body == "" {
+		return p.Tag
+	}
+	return p.Tag + "\n\n" + body
+}
+
+// Modes for what the changelog stage creates. A changelog is an ordinary source
+// file that gets committed, so it takes the ordinary modes.
+const (
+	dirMode       = 0o755
+	changelogMode = 0o644
+)
 
 func undoCommitHint(committed bool) string {
 	if committed {

@@ -1131,3 +1131,392 @@ func TestUnknownCommand(t *testing.T) {
 	}
 	requireContains(t, out, "unknown command")
 }
+
+// ---------------------------------------------------------------------------
+// changelog
+// ---------------------------------------------------------------------------
+
+// stampSplit runs stamp and keeps stdout and stderr apart, for the commands
+// whose whole point is that the markdown pipes and the commentary does not.
+func (r *repo) stampSplit(args ...string) (stdout, stderr string, code int) {
+	r.t.Helper()
+	cmd := exec.Command(stampBin, args...)
+	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(), "NO_COLOR=1")
+	var out, errb strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err := cmd.Run()
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		r.t.Fatalf("running stamp %v: %v", args, err)
+	}
+	return out.String(), errb.String(), code
+}
+
+// note writes a fragment directly, the way a committed branch would carry one.
+func (r *repo) note(name, kind, text string) {
+	r.t.Helper()
+	r.write(filepath.Join(".stamp", "changelog", name+"."+kind+".md"), text+"\n")
+}
+
+func (r *repo) exists(name string) bool {
+	r.t.Helper()
+	_, err := os.Stat(filepath.Join(r.dir, name))
+	return err == nil
+}
+
+// tagBody is what a pipeline reads off the tag it was triggered by.
+func (r *repo) tagBody(tag string) string {
+	r.t.Helper()
+	return r.git("tag", "-l", "--format=%(contents:body)", tag)
+}
+
+// The promise that made the feature acceptable: a repository that never opted
+// in releases exactly as it did before the feature existed.
+func TestReleaseWithoutChangelogIsUntouched(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	out := r.mustStamp("release", "minor", "--yes")
+	requireContains(t, out, "the release has changelog entries: the changelog is not in use")
+
+	if r.exists("CHANGELOG.md") {
+		t.Error("a CHANGELOG.md was created in a repository that never asked for one")
+	}
+	files := strings.Fields(r.git("show", "--name-only", "--pretty=format:", "HEAD"))
+	if len(files) != 1 || files[0] != "VERSION" {
+		t.Errorf("the release commit touched %v, want only VERSION", files)
+	}
+	if body := r.tagBody("v0.5.0"); body != "" {
+		t.Errorf("tag body = %q, want it empty as before", body)
+	}
+	if strings.Contains(out, "Changelog:") {
+		t.Errorf("the plan talks about a changelog nobody has:\n%s", out)
+	}
+}
+
+func TestNoteWritesAFragment(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	out := r.mustStamp("note", "added", "Pre-releases open a beta series")
+	requireContains(t, out, ".stamp/changelog/pre-releases-open-a-beta-series.added.md", "Added",
+		"Commit it with the change it describes")
+
+	got := r.read(".stamp/changelog/pre-releases-open-a-beta-series.added.md")
+	if got != "Pre-releases open a beta series\n" {
+		t.Errorf("fragment = %q", got)
+	}
+
+	// Unquoted, the rest of the line is the text.
+	r.mustStamp("note", "fixed", "Tag", "creation", "no", "longer", "leaves", "the", "commit")
+	if !r.exists(".stamp/changelog/tag-creation-no-longer-leaves-the.fixed.md") {
+		t.Errorf("the unquoted form did not write a fragment: %v", r.git("status", "--porcelain"))
+	}
+}
+
+func TestNoteInAComponentRepository(t *testing.T) {
+	r := monorepo(t)
+
+	out := r.mustStamp("note", "web", "changed", "The header is sticky now")
+	requireContains(t, out, ".stamp/changelog/web/the-header-is-sticky-now.changed.md")
+	if !r.exists(".stamp/changelog/web/the-header-is-sticky-now.changed.md") {
+		t.Error("the fragment did not land in the component's own directory")
+	}
+}
+
+func TestNoteRejectsAnUnknownKind(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	out, code := r.stamp("note", "frobnicated", "something")
+	if code == 0 {
+		t.Fatalf("expected a usage error:\n%s", out)
+	}
+	requireContains(t, out, "added, changed, deprecated, removed, fixed, security")
+}
+
+func TestChangelogCommandPrintsThePendingSection(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.note("beta-series", "added", "Pre-releases open a beta series")
+	r.note("tag-creation", "fixed", "Tag creation no longer leaves the commit behind")
+	r.commitAll("notes")
+
+	stdout, stderr, code := r.stampSplit("changelog")
+	if code != 0 {
+		t.Fatalf("exited %d:\n%s%s", code, stdout, stderr)
+	}
+	requireContains(t, stdout, "## Unreleased", "### Added",
+		"- Pre-releases open a beta series", "### Fixed",
+		"- Tag creation no longer leaves the commit behind")
+	if strings.Contains(stdout, "drafts") {
+		t.Errorf("noted entries were announced as drafts:\n%s", stdout)
+	}
+}
+
+func TestChangelogCommandSaysWhenThereIsNothing(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	stdout, stderr, code := r.stampSplit("changelog")
+	if code != 0 {
+		t.Fatalf("exited %d, want 0: nothing noted is a state, not a failure\n%s", code, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want nothing to pipe", stdout)
+	}
+	requireContains(t, stderr, "Nothing noted yet")
+}
+
+// The whole feature end to end: the fragments become a section, the section
+// becomes the file and the tag body, and all of it is one commit.
+func TestReleaseRendersFragmentsIntoTheCommitAndTheTag(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.note("beta-series", "added", "Pre-releases open a beta series")
+	r.note("tag-creation", "fixed", "Tag creation no longer leaves the commit behind")
+	r.commitAll("notes")
+	r.push()
+
+	out := r.mustStamp("release", "minor", "--yes")
+	requireContains(t, out, "Changelog:", "Added: Pre-releases open a beta series",
+		"2 entries from .stamp/changelog", "updated CHANGELOG.md")
+
+	rendered := r.read("CHANGELOG.md")
+	requireContains(t, rendered, "# Changelog", "## 0.5.0 - ", "### Added",
+		"- Pre-releases open a beta series", "### Fixed")
+
+	if r.exists(".stamp/changelog/beta-series.added.md") {
+		t.Error("the fragment was not collected")
+	}
+
+	files := strings.Fields(r.git("show", "--stat", "--name-only", "--pretty=format:", "HEAD"))
+	want := map[string]bool{
+		"CHANGELOG.md":                           false,
+		"VERSION":                                false,
+		".stamp/changelog/beta-series.added.md":  false,
+		".stamp/changelog/tag-creation.fixed.md": false,
+	}
+	for _, f := range files {
+		if _, ok := want[f]; !ok {
+			t.Errorf("the release commit also touched %s", f)
+			continue
+		}
+		want[f] = true
+	}
+	for f, seen := range want {
+		if !seen {
+			t.Errorf("%s is not in the release commit; it holds %v", f, files)
+		}
+	}
+
+	body := r.tagBody("v0.5.0")
+	requireContains(t, body, "### Added", "- Pre-releases open a beta series", "### Fixed")
+	if strings.Contains(body, "## 0.5.0") {
+		t.Errorf("the tag body repeats the version the tag already names:\n%s", body)
+	}
+
+	// Nothing left over: the collected fragments are gone from the tree too.
+	if status := r.git("status", "--porcelain"); status != "" {
+		t.Errorf("the tree is dirty after the release:\n%s", status)
+	}
+}
+
+// The first-release case writes no version file, but a changelog it has to
+// publish is still written and still committed.
+func TestUnchangedVersionStillCommitsTheChangelog(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.1.0")
+	r.note("first-cut", "added", "The first release")
+	r.commitAll("notes")
+	r.push()
+	head := r.git("rev-parse", "HEAD")
+
+	out := r.mustStamp("release", "0.1.0", "--yes")
+	requireContains(t, out, "version already at 0.1.0, committing the changelog")
+
+	if r.git("rev-parse", "HEAD") == head {
+		t.Fatal("the changelog was not committed")
+	}
+	requireContains(t, r.read("CHANGELOG.md"), "## 0.1.0 - ", "- The first release")
+	if r.exists(".stamp/changelog/first-cut.added.md") {
+		t.Error("the fragment was not collected")
+	}
+	if got := strings.TrimSpace(r.read("VERSION")); got != "0.1.0" {
+		t.Errorf("VERSION = %q, it should not have been rewritten", got)
+	}
+	if r.git("rev-list", "-n1", "v0.1.0") != r.git("rev-parse", "HEAD") {
+		t.Error("the tag does not point at the changelog commit")
+	}
+}
+
+func TestChangelogRequireFailsWhenNothingWasNoted(t *testing.T) {
+	r := newRepo(t)
+	r.write("VERSION", "0.4.0\n")
+	r.write(".stamp.yml", "version:\n  - VERSION\nchangelog:\n  require: true\n")
+	r.commitAll("initial")
+	r.push()
+
+	out, code := r.stamp("release", "minor", "--yes")
+	if code == 0 {
+		t.Fatalf("expected preflight to fail:\n%s", out)
+	}
+	requireContains(t, out, "the release has changelog entries", "nothing noted",
+		"changelog.require", "preflight failed, nothing was changed")
+	if r.exists("CHANGELOG.md") {
+		t.Error("a failed preflight wrote a changelog")
+	}
+	if r.git("tag", "--list") != "" {
+		t.Error("a tag was created")
+	}
+}
+
+func TestCommitsFallbackDraftsEntriesAndSaysSo(t *testing.T) {
+	r := newRepo(t)
+	r.write("VERSION", "0.4.0\n")
+	r.write(".stamp.yml", "version:\n  - VERSION\nchangelog:\n  fallback: commits\n")
+	r.commitAll("initial")
+	r.push()
+	r.write("app.go", "package app\n")
+	r.commitAll("feat: add the widget")
+	r.write("notes.txt", "x\n")
+	r.commitAll("chore: tidy up")
+	r.push()
+
+	out := r.mustStamp("release", "minor", "--dry-run")
+	requireContains(t, out, "Changelog:", "Drafted from the commits", "Added: Add the widget",
+		"drafted from commits")
+	if strings.Contains(out, "Tidy up") {
+		t.Errorf("a chore commit was drafted into the changelog:\n%s", out)
+	}
+}
+
+// A failure after the changelog was written must put the fragments and the
+// file back, and leave no CHANGELOG.md behind in a repository that had none.
+func TestRollbackRestoresTheChangelogAndItsFragments(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the hook this uses to fail the commit needs a POSIX shell")
+	}
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.note("beta-series", "added", "Pre-releases open a beta series")
+	r.commitAll("notes")
+	r.push()
+	head := r.git("rev-parse", "HEAD")
+
+	hook := filepath.Join(r.dir, ".git", "hooks", "pre-commit")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := r.stamp("release", "minor", "--yes")
+	if code == 0 {
+		t.Fatalf("expected the commit to fail:\n%s", out)
+	}
+	requireContains(t, out, "Release aborted", "Restored:", "VERSION → 0.4.0",
+		"CHANGELOG.md → removed", ".stamp/changelog/beta-series.added.md → restored")
+
+	if got := r.read("VERSION"); got != "0.4.0\n" {
+		t.Errorf("VERSION = %q, want it restored", got)
+	}
+	if r.exists("CHANGELOG.md") {
+		t.Error("the CHANGELOG.md stamp created was left behind")
+	}
+	if got := r.read(".stamp/changelog/beta-series.added.md"); got != "Pre-releases open a beta series\n" {
+		t.Errorf("the fragment came back as %q", got)
+	}
+	if r.git("rev-parse", "HEAD") != head {
+		t.Error("a commit was left behind")
+	}
+	if r.git("tag", "--list") != "" {
+		t.Error("a tag was left behind")
+	}
+	if staged := r.git("diff", "--cached", "--name-only"); staged != "" {
+		t.Errorf("index holds %q", staged)
+	}
+	if status := r.git("status", "--porcelain"); status != "" {
+		t.Errorf("the tree is dirty after the rollback:\n%s", status)
+	}
+}
+
+// --edit needs somebody to do the editing, the same way the confirmation
+// prompt does.
+func TestEditRefusesWhenNotATerminal(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.note("beta-series", "added", "Pre-releases open a beta series")
+	r.commitAll("notes")
+	r.push()
+
+	out, code := r.stamp("release", "minor", "--yes", "--edit")
+	if code == 0 {
+		t.Fatalf("expected --edit to be refused:\n%s", out)
+	}
+	requireContains(t, out, "--edit needs a terminal")
+	if r.exists("CHANGELOG.md") {
+		t.Error("something was written anyway")
+	}
+}
+
+// The editor's last word is the section, including the word "nothing": an
+// emptied file publishes no notes rather than being read as a slip.
+func TestEditSection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake editor this uses is a shell script")
+	}
+	dir := t.TempDir()
+	editor := filepath.Join(dir, "editor.sh")
+	script := "#!/bin/sh\nprintf '## 0.5.0 - 2026-01-01\\n\\n### Added\\n\\n- Edited\\n' > \"$1\"\n"
+	if err := os.WriteFile(editor, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VISUAL", editor)
+	t.Setenv("EDITOR", "")
+
+	got, err := editSection("## 0.5.0 - 2026-01-01\n\n### Added\n\n- Original\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "- Edited") || strings.Contains(got, "- Original") {
+		t.Errorf("section = %q, want what the editor left", got)
+	}
+
+	emptier := filepath.Join(dir, "empty.sh")
+	if err := os.WriteFile(emptier, []byte("#!/bin/sh\n: > \"$1\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VISUAL", emptier)
+	got, err = editSection("## 0.5.0 - 2026-01-01\n\n### Added\n\n- Original\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Errorf("section = %q, want an emptied file honoured as \"publish nothing\"", got)
+	}
+
+	t.Setenv("VISUAL", "")
+	if _, err := editSection("x"); err == nil {
+		t.Error("expected an error naming $VISUAL and $EDITOR")
+	}
+}
+
+// A release with many notes still has to fit on a screen: the plan lists the
+// first ten and counts the rest, so the check list stays visible.
+func TestPlanTruncatesALongChangelog(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	for i := 0; i < 13; i++ {
+		r.note(fmt.Sprintf("note-%02d", i), "added", fmt.Sprintf("Entry number %02d", i))
+	}
+	r.commitAll("notes")
+	r.push()
+
+	out := r.mustStamp("release", "minor", "--dry-run")
+	requireContains(t, out, "Added: Entry number 00", "Added: Entry number 09", "… and 3 more",
+		"the release has 13 entries from .stamp/changelog")
+	if strings.Contains(out, "Entry number 10") {
+		t.Errorf("the plan printed more than ten entries:\n%s", out)
+	}
+}

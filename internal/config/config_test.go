@@ -342,3 +342,214 @@ func TestExpandTolerantOfWhitespace(t *testing.T) {
 		t.Errorf("RenderCommit = %q", got)
 	}
 }
+
+// A repository that says nothing about a changelog still carries the defaults,
+// so the rest of stamp has values to work with even while the feature is off.
+func TestChangelogDefaults(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "VERSION", "1.0.0\n")
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl := cfg.Only().Changelog
+	if cl.File != DefaultChangelogFile || cl.Dir != DefaultChangelogDir {
+		t.Errorf("file = %q, dir = %q", cl.File, cl.Dir)
+	}
+	if cl.Fallback != DefaultChangelogFallback || cl.Require || !cl.TagBody {
+		t.Errorf("fallback = %q require = %v tag_body = %v", cl.Fallback, cl.Require, cl.TagBody)
+	}
+	if cl.Declared {
+		t.Error("Declared should be false without a changelog block")
+	}
+}
+
+func TestChangelogEveryKey(t *testing.T) {
+	dir := t.TempDir()
+	cfg := load(t, dir, `
+version: VERSION
+
+changelog:
+  file: docs/CHANGES.md
+  dir: .changes
+  fallback: none
+  require: true
+  tag_body: false
+`)
+	cl := cfg.Only().Changelog
+	if cl.File != "docs/CHANGES.md" || cl.Dir != ".changes" {
+		t.Errorf("file = %q, dir = %q", cl.File, cl.Dir)
+	}
+	if cl.Fallback != "none" || !cl.Require || cl.TagBody {
+		t.Errorf("fallback = %q require = %v tag_body = %v", cl.Fallback, cl.Require, cl.TagBody)
+	}
+	if !cl.Declared {
+		t.Error("Declared should be set by a changelog block")
+	}
+}
+
+// A component's changelog overrides the keys it names and inherits the rest
+// from the top-level block, exactly like the release keys.
+func TestChangelogComponentOverride(t *testing.T) {
+	dir := t.TempDir()
+	cfg := load(t, dir, `
+changelog:
+  dir: .changes
+  fallback: none
+  require: true
+
+components:
+  cli:
+    version: VERSION
+    tag: cli-v{{version}}
+    changelog:
+      file: cli/CHANGELOG.md
+  web:
+    version: web/package.json#version
+    tag: web-v{{version}}
+    changelog:
+      file: web/CHANGELOG.md
+      require: false
+`)
+	cli := cfg.Lookup("cli").Changelog
+	if cli.File != "cli/CHANGELOG.md" {
+		t.Errorf("cli file = %q, the override did not win", cli.File)
+	}
+	if cli.Dir != ".changes" || cli.Fallback != "none" || !cli.Require || !cli.TagBody {
+		t.Errorf("cli did not inherit the unnamed keys: %+v", cli)
+	}
+
+	web := cfg.Lookup("web").Changelog
+	if web.File != "web/CHANGELOG.md" || web.Require {
+		t.Errorf("web overrides did not win: %+v", web)
+	}
+	if web.Dir != ".changes" || web.Fallback != "none" {
+		t.Errorf("web did not inherit the unnamed keys: %+v", web)
+	}
+}
+
+// An empty file: is how a repository says "carry the entries into the tag, but
+// render no file"; it still declares the block.
+func TestChangelogEmptyFileIsLegal(t *testing.T) {
+	dir := t.TempDir()
+	cfg := load(t, dir, "version: VERSION\nchangelog:\n  file: \"\"\n")
+	cl := cfg.Only().Changelog
+	if cl.File != "" {
+		t.Errorf("file = %q, want it empty", cl.File)
+	}
+	if !cl.Declared {
+		t.Error("an empty file: still declares a changelog block")
+	}
+	if !cfg.Only().ChangelogEnabled(dir) {
+		t.Error("a declared block enables the changelog")
+	}
+}
+
+func TestChangelogRejects(t *testing.T) {
+	tests := []struct{ name, yaml, want string }{
+		{"unknown changelog key", "version: VERSION\nchangelog:\n  fil: CHANGELOG.md\n", "unknown key"},
+		{"unknown component changelog key", "components:\n  a:\n    version: VERSION\n    changelog:\n      dirr: x\n", "unknown key"},
+		{"a fallback that is neither", "version: VERSION\nchangelog:\n  fallback: guess\n", `it must be "commits" or "none"`},
+		{"changelog that is not a mapping", "version: VERSION\nchangelog: CHANGELOG.md\n", "must be a mapping"},
+		{"an absolute file", "version: VERSION\nchangelog:\n  file: /tmp/CHANGELOG.md\n", "is absolute"},
+		{"an absolute dir", "version: VERSION\nchangelog:\n  dir: /tmp/changes\n", "is absolute"},
+		{"a file walking out", "version: VERSION\nchangelog:\n  file: ../CHANGELOG.md\n", "walks up"},
+		{"a dir walking out", "version: VERSION\nchangelog:\n  dir: ../changes\n", "walks up"},
+		{"an empty dir", "version: VERSION\nchangelog:\n  dir: \"\"\n", "name the directory"},
+		{
+			"two components rendering into one file",
+			"changelog:\n  file: CHANGELOG.md\ncomponents:\n  a:\n    version: A\n    tag: a-v{{version}}\n  b:\n    version: B\n    tag: b-v{{version}}\n",
+			"would both render into",
+		},
+	}
+	for _, tc := range tests {
+		dir := t.TempDir()
+		err := loadErr(t, dir, tc.yaml)
+		if err == nil {
+			t.Errorf("%s: was accepted, want an error", tc.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want it to mention %q", tc.name, err, tc.want)
+		}
+	}
+}
+
+// Two components may collect fragments in one directory: each writes into its
+// own subdirectory of it.
+func TestChangelogComponentsMayShareADir(t *testing.T) {
+	dir := t.TempDir()
+	cfg := load(t, dir, `
+changelog:
+  dir: .stamp/changelog
+
+components:
+  a:
+    version: A
+    tag: a-v{{version}}
+    changelog:
+      file: a/CHANGELOG.md
+  b:
+    version: B
+    tag: b-v{{version}}
+    changelog:
+      file: b/CHANGELOG.md
+`)
+	if cfg.Lookup("a").Changelog.Dir != cfg.Lookup("b").Changelog.Dir {
+		t.Error("both components should have inherited the shared dir")
+	}
+}
+
+// The feature is opt-in by use: it turns on when the config declares it, when
+// fragments have been written, or when a changelog file is already there.
+func TestChangelogEnabled(t *testing.T) {
+	t.Run("off by default", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, dir, "VERSION", "1.0.0\n")
+		cfg, err := Load(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Only().ChangelogEnabled(dir) {
+			t.Error("a repository that says nothing about a changelog has it off")
+		}
+	})
+
+	t.Run("declared in the config", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := load(t, dir, "version: VERSION\nchangelog:\n  fallback: none\n")
+		write(t, dir, "VERSION", "1.0.0\n")
+		if !cfg.Only().ChangelogEnabled(dir) {
+			t.Error("a declared block turns the changelog on")
+		}
+	})
+
+	t.Run("the fragment directory exists", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, dir, "VERSION", "1.0.0\n")
+		if err := os.MkdirAll(filepath.Join(dir, DefaultChangelogDir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.Only().ChangelogEnabled(dir) {
+			t.Error("written fragments turn the changelog on")
+		}
+	})
+
+	t.Run("the changelog file exists", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, dir, "VERSION", "1.0.0\n")
+		write(t, dir, DefaultChangelogFile, "# Changelog\n")
+		cfg, err := Load(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.Only().ChangelogEnabled(dir) {
+			t.Error("an existing changelog file turns the changelog on")
+		}
+	})
+}
