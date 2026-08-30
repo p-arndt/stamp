@@ -1,26 +1,28 @@
-# stamp — task runner
+# stamp - task runner
 #
 # Requires just >= 1.39 (for the `read()` function used to read VERSION).
 #
 # Layout:
-#   main.go              — the `stamp` CLI entry point   (-> stamp / stamp.exe)
-#   internal/config      — .stamp.yml plus auto-detection
-#   internal/source      — VERSION-file and JSON version locations
-#   internal/version     — semver resolution and bumping
-#   internal/gitx        — the git commands stamp needs
-#   internal/release     — preflight, write, commit, tag, push
-#   internal/ui          — terminal output and the confirmation prompt
+#   main.go              - the `stamp` CLI entry point   (-> stamp / stamp.exe)
+#   internal/config      - .stamp.yml, components, plus auto-detection
+#   internal/source      - version locations: text file, JSON, YAML, TOML fields
+#   internal/version     - semver resolution and bumping
+#   internal/gitx        - the git commands stamp needs
+#   internal/release     - preflight, write, commit, tag, push
+#   internal/ui          - terminal output and the confirmation prompt
 #   (self-update and the update notice come from github.com/p-arndt/selfupdate)
-#   VERSION              — single source of truth (stamped into the binary)
+#   install.sh           - one-liner installer for macOS and Linux (curl … | sh)
+#   install.ps1          - one-liner installer for Windows        (irm … | iex)
+#   VERSION              - single source of truth (stamped into the binary)
 #
 # Portability: recipe bodies are plain command invocations with no shell syntax,
 # so the same line runs under both `sh` and PowerShell. Where a task genuinely
 # needs shell logic it is split into `[unix]` and `[windows]` recipes of the
-# same name — just picks the right one per platform.
+# same name, and just picks the right one per platform.
 
 set windows-shell := ["pwsh.exe", "-NoLogo", "-NoProfile", "-Command"]
 
-# Static, libc-free binaries — the same thing the release workflow ships.
+# Static, libc-free binaries: the same thing the release workflow ships.
 export CGO_ENABLED := "0"
 
 BIN := if os_family() == "windows" { "stamp.exe" } else { "stamp" }
@@ -61,8 +63,8 @@ install: build-release
 # Quality
 # ---------------------------------------------------------------------------
 
-# Run vet and the full test suite — what CI runs.
-check: vet test
+# Run vet, the full test suite and the installer syntax checks. What CI runs.
+check: vet test check-installers
 
 vet:
     go vet ./...
@@ -79,6 +81,33 @@ test-race:
 
 fmt:
     gofmt -w .
+
+# Parse both install scripts without running them.
+[unix]
+check-installers:
+    #!/usr/bin/env sh
+    # The installers are served straight from the default branch to people
+    # piping them into a shell, so a syntax error is published the moment it is
+    # pushed, and this recipe is the gate before that happens. shellcheck and pwsh
+    # are used when present and skipped when not; the parse checks themselves
+    # are what must always run.
+    set -e
+    sh -n install.sh
+    if command -v shellcheck >/dev/null 2>&1; then
+        shellcheck install.sh
+    else
+        echo "shellcheck not found, install.sh only checked with sh -n"
+    fi
+    if command -v pwsh >/dev/null 2>&1; then
+        pwsh -NoLogo -NoProfile -Command '$e = $null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install.ps1), [ref]$null, [ref]$e); if ($e) { $e; exit 1 }'
+    else
+        echo "pwsh not found, install.ps1 not parsed"
+    fi
+
+[windows]
+check-installers:
+    $e = $null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install.ps1), [ref]$null, [ref]$e); if ($e) { $e; exit 1 }
+    if (Get-Command sh -ErrorAction SilentlyContinue) { sh -n install.sh } else { Write-Host "sh not found - install.sh not checked" }
 
 [unix]
 fmt-check:

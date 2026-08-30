@@ -1,6 +1,6 @@
 // Package release carries out a release: preflight, write, commit, tag, push.
 //
-// The order is deliberate — every check that can be made runs *before* the
+// The order is deliberate: every check that can be made runs *before* the
 // first file is written. That way the common failure (dirty tree, wrong branch,
 // tag already taken) never leaves anything to undo. What happens after the
 // first write is undone stage by stage, back to the last state that is
@@ -43,7 +43,10 @@ type Options struct {
 
 // Plan is everything stamp resolved before touching the repository.
 type Plan struct {
-	Config  *config.Config
+	Config *config.Config
+	// Comp is the component being released. A repository that declares none
+	// has exactly one, and this is it.
+	Comp    *config.Component
 	Repo    *gitx.Repo
 	Options Options
 
@@ -71,24 +74,24 @@ type check struct {
 
 // Prepare resolves the plan and runs every preflight check. It returns a plan
 // even when checks failed, so the caller can print the full list.
-func Prepare(cfg *config.Config, repo *gitx.Repo, opts Options) (*Plan, error) {
-	p := &Plan{Config: cfg, Repo: repo, Options: opts, Remote: cfg.Remote}
+func Prepare(cfg *config.Config, comp *config.Component, repo *gitx.Repo, opts Options) (*Plan, error) {
+	p := &Plan{Config: cfg, Comp: comp, Repo: repo, Options: opts, Remote: comp.Remote}
 
-	current, err := cfg.Source.Read()
+	current, err := comp.Source().Read()
 	if err != nil {
 		return nil, fmt.Errorf("reading the current version: %w", err)
 	}
 	p.Current = current
 
-	next, err := resolve(cfg, opts, current)
+	next, err := resolve(comp, opts, current)
 	if err != nil {
 		return nil, err
 	}
 	p.Next = next
-	p.Tag = cfg.RenderTag(next)
-	p.Commit = cfg.RenderCommit(next, p.Tag)
+	p.Tag = comp.RenderTag(next)
+	p.Commit = comp.RenderCommit(next, p.Tag)
 
-	wantBranch := cfg.Branch
+	wantBranch := comp.Branch
 	if opts.Branch != "" {
 		wantBranch = opts.Branch
 	}
@@ -105,12 +108,12 @@ func Prepare(cfg *config.Config, repo *gitx.Repo, opts Options) (*Plan, error) {
 //
 // Where the identifier comes from, in order: --type, then the series the
 // current version is already in, then the configured default. The middle step
-// is what keeps a series walkable — after `--type rc` put the project on
-// 1.3.0-rc.1, a plain `stamp prerelease patch` has to continue at rc.2. Taking
-// the configured default there would resolve to 1.3.0-beta.1, which is *lower*
-// in semver, so the run would die in preflight and every further cut would need
-// --type rc forever.
-func resolve(cfg *config.Config, opts Options, current string) (string, error) {
+// is what keeps a series walkable. After `--type rc` put the project on
+// 1.3.0-rc.1, a bare `stamp prerelease` has to continue at rc.2 rather than
+// drop back to the configured beta, which would be *lower* in semver and would
+// die in preflight. It applies to the bare form only: a bump opens a series for
+// a different release, and that one starts at the configured identifier again.
+func resolve(comp *config.Component, opts Options, current string) (string, error) {
 	if !opts.Pre {
 		return version.Resolve(current, opts.Arg)
 	}
@@ -119,7 +122,7 @@ func resolve(cfg *config.Config, opts Options, current string) (string, error) {
 		id = version.PreIDOf(current)
 	}
 	if id == "" {
-		id = cfg.PreID
+		id = comp.PreID
 	}
 	return version.ResolvePre(current, opts.Arg, id)
 }
@@ -137,30 +140,30 @@ func (p *Plan) preflight() error {
 		p.Unchanged = equal
 		label := fmt.Sprintf("%s is newer than %s", p.Next, p.Current)
 		if equal {
-			label = fmt.Sprintf("version already at %s — tagging HEAD, no commit", p.Next)
+			label = fmt.Sprintf("version already at %s, tagging HEAD, no commit", p.Next)
 		}
 		p.add(check{label: label, ok: true})
 	}
 
-	// Every mirror must currently agree with the source. A mirror that has
-	// drifted is a sign something bumped one place by hand, and silently
-	// overwriting it would hide that.
-	for _, m := range p.Config.Mirrors {
+	// Every further location must currently agree with the first one. A file
+	// that has drifted is a sign something bumped one place by hand, and
+	// silently overwriting it would hide that.
+	for _, m := range p.Comp.Mirrors() {
+		label := fmt.Sprintf("%s agrees with %s", m.Describe(), p.Comp.Source().Path())
 		got, err := m.Read()
 		switch {
 		case err != nil:
-			p.add(check{label: fmt.Sprintf("mirror %s is readable", m.Describe()), ok: false, detail: err.Error()})
+			p.add(check{label: fmt.Sprintf("%s is readable", m.Describe()), ok: false, detail: err.Error()})
 		case got != p.Current && got != p.Next:
-			p.add(check{label: fmt.Sprintf("mirror %s agrees with %s", m.Describe(), p.Config.Source.Path()), ok: false,
-				detail: fmt.Sprintf("holds %s, expected %s", got, p.Current)})
+			p.add(check{label: label, ok: false, detail: fmt.Sprintf("holds %s, expected %s", got, p.Current)})
 		default:
-			p.add(check{label: fmt.Sprintf("mirror %s agrees with %s", m.Describe(), p.Config.Source.Path()), ok: true})
+			p.add(check{label: label, ok: true})
 		}
 	}
 
 	if !p.Repo.HasCommits() {
 		p.add(check{label: "repository has at least one commit", ok: false,
-			detail: "the repository is empty — commit something before releasing"})
+			detail: "the repository is empty, commit something before releasing"})
 		return nil
 	}
 
@@ -172,7 +175,7 @@ func (p *Plan) preflight() error {
 	p.add(check{
 		label:  fmt.Sprintf("on branch %s", p.Branch),
 		ok:     branch == p.Branch,
-		detail: fmt.Sprintf("HEAD is on %s — check out %s, set release.branch in %s, or pass --branch %s", branch, p.Branch, config.FileName, branch),
+		detail: fmt.Sprintf("HEAD is on %s, check out %s, set release.branch in %s, or pass --branch %s", branch, p.Branch, config.FileName, branch),
 	})
 
 	clean, err := p.Repo.IsClean()
@@ -182,7 +185,7 @@ func (p *Plan) preflight() error {
 	dirtyDetail := ""
 	if !clean {
 		paths, _ := p.Repo.DirtyPaths()
-		dirtyDetail = fmt.Sprintf("%d uncommitted change(s) — the release commit must hold only the version bump", len(paths))
+		dirtyDetail = fmt.Sprintf("%d uncommitted change(s); the release commit must hold only the version bump", len(paths))
 	}
 	p.add(check{label: "working tree clean", ok: clean, detail: dirtyDetail})
 
@@ -226,7 +229,7 @@ func (p *Plan) upstreamCheck(branch string) {
 		// No upstream yet: the first push will create it. Not a failure, but
 		// worth saying out loud, because the push will need -u semantics.
 		p.add(check{label: "branch up to date with the remote", skipped: true,
-			detail: fmt.Sprintf("%s has no upstream yet — the push will create it", branch)})
+			detail: fmt.Sprintf("%s has no upstream yet, the push will create it", branch)})
 		return
 	}
 	ahead, behind, err := p.Repo.Divergence(branch, upstream)
@@ -236,7 +239,7 @@ func (p *Plan) upstreamCheck(branch string) {
 	}
 	if behind > 0 {
 		p.add(check{label: fmt.Sprintf("up to date with %s", upstream), ok: false,
-			detail: fmt.Sprintf("%d commit(s) behind — pull first", behind)})
+			detail: fmt.Sprintf("%d commit(s) behind, pull first", behind)})
 		return
 	}
 	label := fmt.Sprintf("up to date with %s", upstream)
@@ -259,7 +262,7 @@ func (p *Plan) OK() bool {
 }
 
 // WillPush reports whether this run ends in a push.
-func (p *Plan) WillPush() bool { return p.Config.Push && !p.Options.NoPush }
+func (p *Plan) WillPush() bool { return p.Comp.Push && !p.Options.NoPush }
 
 // Print renders the plan and the check list.
 func (p *Plan) Print() {
@@ -267,7 +270,10 @@ func (p *Plan) Print() {
 	if p.Options.Pre {
 		title = "Pre-release %s"
 	}
-	ui.Title(title, p.Config.ProjectName)
+	ui.Title(title, p.Comp.Label())
+	if p.Config.Multi {
+		ui.Field("Component", fmt.Sprintf("%s of %s", p.Comp.Name, p.Config.ProjectName))
+	}
 	ui.Field("Version", ui.Bump(p.Current, p.Next))
 	if pre := version.PreOf(p.Next); pre != "" {
 		ui.Field("Pre-release", fmt.Sprintf("%s (not a stable release)", pre))
@@ -283,12 +289,12 @@ func (p *Plan) Print() {
 		ui.Field("Remote", "(not pushing)")
 	}
 	if !p.Config.FromFile {
-		ui.Field("Config", fmt.Sprintf("none — detected %s", p.Config.Source.Describe()))
+		ui.Field("Config", fmt.Sprintf("none, detected %s", p.Comp.Source().Describe()))
 	}
 
 	if !p.Unchanged {
 		ui.Section("Files to update:")
-		for _, s := range p.Config.AllSources() {
+		for _, s := range p.Comp.Sources {
 			ui.Item(s.Describe())
 		}
 	}
@@ -297,11 +303,11 @@ func (p *Plan) Print() {
 	for _, c := range p.checks {
 		switch {
 		case c.skipped:
-			ui.Skip(fmt.Sprintf("%s — %s", c.label, c.detail))
+			ui.Skip(fmt.Sprintf("%s: %s", c.label, c.detail))
 		case c.ok:
 			ui.Pass(c.label)
 		case c.detail != "":
-			ui.Fail(fmt.Sprintf("%s — %s", c.label, c.detail))
+			ui.Fail(fmt.Sprintf("%s: %s", c.label, c.detail))
 		default:
 			ui.Fail(c.label)
 		}
@@ -321,7 +327,7 @@ func (p *Plan) Run() error {
 	var written []snapshot
 
 	// restore puts every written file back and reports what it restored. It is
-	// passed to fail, which prints it *after* the reason for the abort — the
+	// passed to fail, which prints it *after* the reason for the abort, because the
 	// user wants to read why it stopped before what it undid.
 	restore := func() {
 		if len(written) == 0 {
@@ -338,7 +344,7 @@ func (p *Plan) Run() error {
 	}
 
 	if !p.Unchanged {
-		for _, src := range p.Config.AllSources() {
+		for _, src := range p.Comp.Sources {
 			abs := filepath.Join(p.Repo.Root, src.Path())
 			data, mode, err := readWithMode(abs)
 			if err != nil {
@@ -352,23 +358,23 @@ func (p *Plan) Run() error {
 		}
 	}
 
-	// Commit. The version files are staged explicitly — never `commit -a` —
+	// Commit. The version files are staged explicitly, never `commit -a`,
 	// so nothing that appeared in the tree meanwhile can slip into the release
 	// commit.
 	committed := false
 	if !p.Unchanged {
-		changed, err := p.Repo.HasChanges(p.Config.Paths()...)
+		changed, err := p.Repo.HasChanges(p.Comp.Paths()...)
 		if err != nil {
 			return fail(err, restore, notNothing...)
 		}
 		if changed {
-			if err := p.Repo.Add(p.Config.Paths()...); err != nil {
+			if err := p.Repo.Add(p.Comp.Paths()...); err != nil {
 				return fail(err, restore, notNothing...)
 			}
 			if err := p.Repo.Commit(p.Commit); err != nil {
 				// Unstage before restoring, so the index does not keep a
 				// staged version bump that the working tree no longer has.
-				if uerr := p.Repo.Unstage(p.Config.Paths()...); uerr != nil {
+				if uerr := p.Repo.Unstage(p.Comp.Paths()...); uerr != nil {
 					ui.Errorf("could not unstage: %v", uerr)
 				}
 				return fail(err, restore, notNothing...)
@@ -385,7 +391,7 @@ func (p *Plan) Run() error {
 		ui.Blank()
 		ui.Errorf("creating tag %s failed: %v", p.Tag, err)
 		if committed {
-			ui.Hint("the release commit %q was created and was kept — it is valid on its own", p.Commit)
+			ui.Hint("the release commit %q was created and was kept; it is valid on its own", p.Commit)
 			ui.Hint("continue with: git tag -a %s -m %s && git push %s %s %s", p.Tag, p.Tag, p.Remote, p.Branch, p.Tag)
 		}
 		return errAborted
@@ -395,7 +401,7 @@ func (p *Plan) Run() error {
 	if !p.WillPush() {
 		ui.Blank()
 		reason := "--no-push"
-		if !p.Config.Push {
+		if !p.Comp.Push {
 			reason = "release.push is false"
 		}
 		ui.Note("Not pushing (%s).", reason)
@@ -410,7 +416,7 @@ func (p *Plan) Run() error {
 	if err := p.Repo.Push(p.Remote, p.Branch, p.Tag); err != nil {
 		ui.Blank()
 		ui.Errorf("push failed: %v", err)
-		ui.Hint("nothing was rolled back — the commit and the tag exist locally and are valid")
+		ui.Hint("nothing was rolled back; the commit and the tag exist locally and are valid")
 		ui.Hint("retry with: git push %s %s %s", p.Remote, p.Branch, p.Tag)
 		ui.Hint("or undo locally with: git tag -d %s%s", p.Tag, undoCommitHint(committed))
 		return errAborted

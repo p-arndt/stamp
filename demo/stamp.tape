@@ -1,4 +1,4 @@
-# stamp — README demo tape.
+# stamp: README demo tape.
 #
 # Recorded by `just demo`, which builds stamp and hands this tape a throwaway
 # repository: a bare remote plus a work tree with a VERSION file and a

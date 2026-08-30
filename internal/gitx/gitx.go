@@ -30,7 +30,7 @@ func Open(dir string) (*Repo, error) {
 }
 
 // CurrentBranch returns the checked-out branch name, or an error when HEAD is
-// detached — releasing from a detached HEAD would tag a commit that no branch
+// detached, because releasing from a detached HEAD would tag a commit that no branch
 // points at.
 func (r *Repo) CurrentBranch() (string, error) {
 	out, err := r.git("rev-parse", "--abbrev-ref", "HEAD")
@@ -38,7 +38,7 @@ func (r *Repo) CurrentBranch() (string, error) {
 		return "", err
 	}
 	if out == "HEAD" {
-		return "", errors.New("HEAD is detached — check out a branch first")
+		return "", errors.New("HEAD is detached, check out a branch first")
 	}
 	return out, nil
 }
@@ -84,7 +84,7 @@ func (r *Repo) TagExists(tag string) (bool, error) {
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
-		return false, nil // "not a valid ref" — the tag is free.
+		return false, nil // "not a valid ref", so the tag is free.
 	}
 	return false, err
 }
@@ -107,7 +107,7 @@ func (r *Repo) Fetch(remote string) error {
 }
 
 // Upstream returns the configured upstream ref of branch (e.g.
-// "origin/main"), or ok=false when the branch has none — which is the normal
+// "origin/main"), or ok=false when the branch has none, which is the normal
 // state of a brand-new repository before its first push.
 func (r *Repo) Upstream(branch string) (ref string, ok bool, err error) {
 	out, err := r.git("rev-parse", "--abbrev-ref", "--symbolic-full-name", branch+"@{upstream}")
@@ -152,7 +152,7 @@ func (r *Repo) Unstage(paths ...string) error {
 	return err
 }
 
-// Commit creates a commit with message. Only what is already staged goes in —
+// Commit creates a commit with message. Only what is already staged goes in:
 // stamp stages the version files explicitly and never uses -a.
 func (r *Repo) Commit(message string) error {
 	_, err := r.git("commit", "-m", message)
@@ -200,7 +200,7 @@ func (r *Repo) DefaultRemote() (string, error) {
 	if len(remotes) == 1 {
 		return remotes[0], nil
 	}
-	return "", fmt.Errorf("several remotes (%s) and none named origin — set release.remote in .stamp.yml", strings.Join(remotes, ", "))
+	return "", fmt.Errorf("several remotes (%s) and none named origin, set release.remote in .stamp.yml", strings.Join(remotes, ", "))
 }
 
 // ShortHEAD returns the abbreviated commit hash of HEAD.

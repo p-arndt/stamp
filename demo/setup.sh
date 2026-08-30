@@ -34,13 +34,8 @@ JSON
 
 cat > .stamp.yml <<'YAML'
 version:
-  source:
-    type: file
-    path: VERSION
-
-  mirrors:
-    - type: json
-      path: package.json
+  - VERSION
+  - package.json#version
 YAML
 
 git add -A
@@ -48,5 +43,5 @@ git commit -q -m "feat: the thing works"
 git remote add origin ../remote.git
 git push -q -u origin main
 
-# A short, stable prompt — the recording should not show anyone's real one.
+# A short, stable prompt: the recording should not show anyone's real one.
 export PS1='\[\e[38;5;213m\]demo\[\e[0m\] $ '

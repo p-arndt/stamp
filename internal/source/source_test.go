@@ -9,6 +9,9 @@ import (
 
 func write(t *testing.T, dir, name, content string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -23,184 +26,318 @@ func read(t *testing.T, dir, name string) string {
 	return string(b)
 }
 
-func TestFileSource(t *testing.T) {
-	dir := t.TempDir()
-	write(t, dir, "VERSION", "0.4.0\n")
-
-	s, err := New(dir, KindFile, "VERSION", "")
+// open builds a source from the shorthand a config would carry.
+func open(t *testing.T, dir, shorthand string) Source {
+	t.Helper()
+	spec, err := ParseSpec(shorthand)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ParseSpec(%q): %v", shorthand, err)
 	}
-	if got, err := s.Read(); err != nil || got != "0.4.0" {
-		t.Fatalf("Read() = %q, %v", got, err)
+	s, err := New(dir, spec)
+	if err != nil {
+		t.Fatalf("New(%q): %v", shorthand, err)
 	}
-	if err := s.Write("0.5.0"); err != nil {
-		t.Fatal(err)
+	return s
+}
+
+// roundTrip is the property that matters for every kind: the version comes back
+// out, the new one goes in, and nothing else in the file moves.
+func roundTrip(t *testing.T, name, shorthand, before, want, after string) {
+	t.Helper()
+	dir := t.TempDir()
+	write(t, dir, name, before)
+
+	s := open(t, dir, shorthand)
+	got, err := s.Read()
+	if err != nil {
+		t.Fatalf("Read: %v", err)
 	}
-	// The trailing newline the file had must survive, so the diff stays one line.
-	if got := read(t, dir, "VERSION"); got != "0.5.0\n" {
-		t.Errorf("contents = %q, want %q", got, "0.5.0\n")
+	if got != want {
+		t.Fatalf("Read = %q, want %q", got, want)
+	}
+	if err := s.Write("0.23.0"); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if got := read(t, dir, name); got != after {
+		t.Errorf("after Write the file is\n%q\nwant\n%q", got, after)
 	}
 }
 
-func TestFileSourceWithoutTrailingNewline(t *testing.T) {
-	dir := t.TempDir()
-	write(t, dir, "VERSION", "0.4.0")
+func TestParseSpec(t *testing.T) {
+	tests := []struct {
+		in    string
+		path  string
+		typ   string
+		field string
+	}{
+		{"VERSION", "VERSION", KindFile, ""},
+		{"package.json", "package.json", KindJSON, "version"},
+		{"package.json#version", "package.json", KindJSON, "version"},
+		{"web/package.json#version", "web/package.json", KindJSON, "version"},
+		{"Chart.yaml#appVersion", "Chart.yaml", KindYAML, "appVersion"},
+		{"chart.yml#a.b.c", "chart.yml", KindYAML, "a.b.c"},
+		{"pyproject.toml#project.version", "pyproject.toml", KindTOML, "project.version"},
+		{"Cargo.toml", "Cargo.toml", KindTOML, "version"},
+	}
+	for _, tc := range tests {
+		spec, err := ParseSpec(tc.in)
+		if err != nil {
+			t.Errorf("ParseSpec(%q): %v", tc.in, err)
+			continue
+		}
+		spec, err = spec.Normalize()
+		if err != nil {
+			t.Errorf("Normalize(%q): %v", tc.in, err)
+			continue
+		}
+		if spec.Path != tc.path || spec.Type != tc.typ || spec.Field != tc.field {
+			t.Errorf("ParseSpec(%q) = %+v, want path=%q type=%q field=%q", tc.in, spec, tc.path, tc.typ, tc.field)
+		}
+	}
+}
 
-	s, _ := New(dir, KindFile, "VERSION", "")
-	if err := s.Write("0.5.0"); err != nil {
-		t.Fatal(err)
+func TestParseSpecRejects(t *testing.T) {
+	for _, in := range []string{"", "#version", "package.json#", "/etc/passwd", "../outside/VERSION", `C:\x\VERSION`, "VERSION#version", "package.json#a..b"} {
+		spec, err := ParseSpec(in)
+		if err == nil {
+			_, err = spec.Normalize()
+		}
+		if err == nil {
+			t.Errorf("%q was accepted, want an error", in)
+		}
 	}
-	if got := read(t, dir, "VERSION"); got != "0.5.0" {
-		t.Errorf("contents = %q, want %q — a newline was added", got, "0.5.0")
+}
+
+// Shorthand is what `stamp init` writes back into the config, so it has to
+// survive a round trip through ParseSpec.
+func TestShorthandRoundTrips(t *testing.T) {
+	for _, in := range []string{"VERSION", "package.json#version", "pyproject.toml#project.version"} {
+		spec, err := ParseSpec(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := spec.Shorthand(); got != in {
+			t.Errorf("Shorthand() = %q, want %q", got, in)
+		}
 	}
+}
+
+func TestFileSource(t *testing.T) {
+	roundTrip(t, "VERSION", "VERSION", "0.22.2\n", "0.22.2", "0.23.0\n")
+}
+
+// The trailing newline convention of the file has to survive, so the diff stays
+// one line either way.
+func TestFileSourceWithoutTrailingNewline(t *testing.T) {
+	roundTrip(t, "VERSION", "VERSION", "0.22.2", "0.22.2", "0.23.0")
 }
 
 func TestFileSourceRejectsMultiLine(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "VERSION", "0.4.0\nsomething else\n")
-	s, _ := New(dir, KindFile, "VERSION", "")
-	if _, err := s.Read(); err == nil {
+	if _, err := open(t, dir, "VERSION").Read(); err == nil {
 		t.Error("a multi-line version file should be rejected")
 	}
 }
 
-// The important property of the JSON source: everything except the version
-// literal comes out byte for byte identical, including tab indentation, key
-// order and the trailing newline.
-func TestJSONSourcePreservesFormatting(t *testing.T) {
+// The important property of every structured kind: everything except the
+// version literal comes out byte for byte identical: indentation, key order,
+// comments and the trailing newline.
+func TestJSONPreservesFormatting(t *testing.T) {
 	const before = "{\n\t\"name\": \"uprox\",\n\t\"version\": \"0.22.2\",\n\t\"private\": true,\n\t\"scripts\": {\n\t\t\"build\": \"vite build\"\n\t}\n}\n"
 	const after = "{\n\t\"name\": \"uprox\",\n\t\"version\": \"0.23.0\",\n\t\"private\": true,\n\t\"scripts\": {\n\t\t\"build\": \"vite build\"\n\t}\n}\n"
-
-	dir := t.TempDir()
-	write(t, dir, "package.json", before)
-
-	s, err := New(dir, KindJSON, "package.json", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, err := s.Read(); err != nil || got != "0.22.2" {
-		t.Fatalf("Read() = %q, %v", got, err)
-	}
-	if err := s.Write("0.23.0"); err != nil {
-		t.Fatal(err)
-	}
-	if got := read(t, dir, "package.json"); got != after {
-		t.Errorf("contents =\n%q\nwant\n%q", got, after)
-	}
+	roundTrip(t, "package.json", "package.json#version", before, "0.22.2", after)
 }
 
-// A nested "version" key must not be mistaken for the top-level one — the case
-// a regexp-based replacement would get wrong.
-func TestJSONSourceIgnoresNestedKeys(t *testing.T) {
+// A nested "version" key must not be mistaken for the top-level one, and the
+// requested path must be followed exactly.
+func TestJSONNestedFields(t *testing.T) {
 	const before = `{
-  "dependencies": {
-    "left-pad": { "version": "1.0.0" }
-  },
-  "overrides": [ { "version": "9.9.9" } ],
-  "version": "0.1.0"
+  "dependencies": {"left-pad": {"version": "1.0.0"}},
+  "app": {"meta": {"version": "0.22.2"}},
+  "version": "9.9.9"
 }
 `
-	dir := t.TempDir()
-	write(t, dir, "package.json", before)
+	const after = `{
+  "dependencies": {"left-pad": {"version": "1.0.0"}},
+  "app": {"meta": {"version": "0.23.0"}},
+  "version": "9.9.9"
+}
+`
+	roundTrip(t, "manifest.json", "manifest.json#app.meta.version", before, "0.22.2", after)
+}
 
-	s, _ := New(dir, KindJSON, "package.json", "version")
-	if got, err := s.Read(); err != nil || got != "0.1.0" {
-		t.Fatalf("Read() = %q, %v", got, err)
+// The version literal is found structurally, so a "version" inside a nested
+// object earlier in the file cannot hijack the write.
+func TestJSONIgnoresNestedVersionKeys(t *testing.T) {
+	const before = "{\n  \"dependencies\": {\n    \"react\": {\"version\": \"18.0.0\"}\n  },\n  \"version\": \"0.22.2\"\n}\n"
+	const after = "{\n  \"dependencies\": {\n    \"react\": {\"version\": \"18.0.0\"}\n  },\n  \"version\": \"0.23.0\"\n}\n"
+	roundTrip(t, "package.json", "package.json#version", before, "0.22.2", after)
+}
+
+func TestJSONRejects(t *testing.T) {
+	tests := []struct{ name, content, shorthand string }{
+		{"not json", "not json at all", "package.json#version"},
+		{"missing field", `{"name": "x"}`, "package.json#version"},
+		{"not a string", `{"version": 3}`, "package.json#version"},
+		{"empty", `{"version": "  "}`, "package.json#version"},
+		{"path into a scalar", `{"version": "1.0.0"}`, "package.json#version.inner"},
 	}
-	if err := s.Write("0.2.0"); err != nil {
-		t.Fatal(err)
-	}
-	got := read(t, dir, "package.json")
-	if want := `"version": "0.2.0"` + "\n}"; !strings.Contains(got, want) {
-		t.Errorf("top-level version was not updated:\n%s", got)
-	}
-	for _, nested := range []string{`"version": "1.0.0"`, `"version": "9.9.9"`} {
-		if !strings.Contains(got, nested) {
-			t.Errorf("nested %s was modified:\n%s", nested, got)
+	for _, tc := range tests {
+		dir := t.TempDir()
+		write(t, dir, "package.json", tc.content)
+		if _, err := open(t, dir, tc.shorthand).Read(); err == nil {
+			t.Errorf("%s: was accepted, want an error", tc.name)
 		}
 	}
 }
 
-func TestJSONSourceCustomField(t *testing.T) {
-	dir := t.TempDir()
-	write(t, dir, "app.json", `{"appVersion": "1.0.0", "version": "not-this-one"}`)
+func TestYAMLPreservesCommentsAndQuoting(t *testing.T) {
+	const before = `apiVersion: v2
+name: app          # the chart's name
+version: 0.22.2    # chart version
+appVersion: "0.22.2"
+`
+	const after = `apiVersion: v2
+name: app          # the chart's name
+version: 0.23.0    # chart version
+appVersion: "0.22.2"
+`
+	roundTrip(t, "Chart.yaml", "Chart.yaml#version", before, "0.22.2", after)
+}
 
-	s, err := New(dir, KindJSON, "app.json", "appVersion")
+// A quoted value stays quoted, in whichever style it was written.
+func TestYAMLKeepsQuotingStyle(t *testing.T) {
+	roundTrip(t, "Chart.yaml", "Chart.yaml#appVersion",
+		"appVersion: \"0.22.2\"\nname: app\n", "0.22.2",
+		"appVersion: \"0.23.0\"\nname: app\n")
+	roundTrip(t, "Chart.yaml", "Chart.yaml#appVersion",
+		"appVersion: '0.22.2'\n", "0.22.2",
+		"appVersion: '0.23.0'\n")
+}
+
+func TestYAMLNestedField(t *testing.T) {
+	const before = "spec:\n  image:\n    tag: 0.22.2\n  replicas: 3\n"
+	const after = "spec:\n  image:\n    tag: 0.23.0\n  replicas: 3\n"
+	roundTrip(t, "values.yaml", "values.yaml#spec.image.tag", before, "0.22.2", after)
+}
+
+func TestYAMLRejects(t *testing.T) {
+	tests := []struct{ name, content, shorthand string }{
+		{"missing field", "name: app\n", "Chart.yaml#version"},
+		{"not a mapping", "- a\n- b\n", "Chart.yaml#version"},
+		{"path into a scalar", "version: 1.0.0\n", "Chart.yaml#version.inner"},
+	}
+	for _, tc := range tests {
+		dir := t.TempDir()
+		write(t, dir, "Chart.yaml", tc.content)
+		if _, err := open(t, dir, tc.shorthand).Read(); err == nil {
+			t.Errorf("%s: was accepted, want an error", tc.name)
+		}
+	}
+}
+
+// A block scalar is refused rather than guessed at: a version does not belong
+// in one, and rewriting it blind could corrupt the file.
+func TestYAMLRefusesBlockScalar(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "Chart.yaml", "version: |\n  0.22.2\n")
+	if err := open(t, dir, "Chart.yaml#version").Write("0.23.0"); err == nil {
+		t.Error("a block scalar should be refused")
+	}
+}
+
+func TestTOMLPreservesFormatting(t *testing.T) {
+	const before = `[project]
+name = "app"      # the distribution name
+version = "0.22.2"
+requires-python = ">=3.11"
+
+[tool.ruff]
+version = "9.9.9"
+`
+	const after = `[project]
+name = "app"      # the distribution name
+version = "0.23.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+version = "9.9.9"
+`
+	roundTrip(t, "pyproject.toml", "pyproject.toml#project.version", before, "0.22.2", after)
+}
+
+// A dependency table holding its own "version" must not be rewritten, and a
+// dotted key spelled out on one line has to be found.
+func TestTOMLDottedAndNestedKeys(t *testing.T) {
+	const before = "[package]\nname = \"app\"\nversion = \"0.22.2\"\n\n[dependencies.serde]\nversion = \"1.0\"\n"
+	const after = "[package]\nname = \"app\"\nversion = \"0.23.0\"\n\n[dependencies.serde]\nversion = \"1.0\"\n"
+	roundTrip(t, "Cargo.toml", "Cargo.toml#package.version", before, "0.22.2", after)
+
+	roundTrip(t, "x.toml", "x.toml#a.b",
+		"a.b = '0.22.2'\nc = 1\n", "0.22.2",
+		"a.b = \"0.23.0\"\nc = 1\n")
+}
+
+func TestTOMLRejects(t *testing.T) {
+	tests := []struct{ name, content, shorthand string }{
+		{"invalid toml", "= = =\n", "x.toml#version"},
+		{"missing field", "name = \"x\"\n", "x.toml#version"},
+		{"not a string", "version = 3\n", "x.toml#version"},
+	}
+	for _, tc := range tests {
+		dir := t.TempDir()
+		write(t, dir, "x.toml", tc.content)
+		if _, err := open(t, dir, tc.shorthand).Read(); err == nil {
+			t.Errorf("%s: was accepted, want an error", tc.name)
+		}
+	}
+}
+
+// A version that only exists in a multi-line string is refused, not mangled.
+func TestTOMLRefusesMultiLineString(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "x.toml", "version = \"\"\"\n0.22.2\n\"\"\"\n")
+	if err := open(t, dir, "x.toml#version").Write("0.23.0"); err == nil {
+		t.Error("a multi-line string should be refused")
+	}
+}
+
+// Writing must not change a file's permissions: a version file may be
+// executable or group-writable for reasons that are none of stamp's business.
+func TestWriteKeepsFileMode(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "VERSION", "0.22.2\n")
+	path := filepath.Join(dir, "VERSION")
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Skipf("chmod unsupported: %v", err)
+	}
+	if err := open(t, dir, "VERSION").Write("0.23.0"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := s.Read(); got != "1.0.0" {
-		t.Fatalf("Read() = %q", got)
-	}
-	if err := s.Write("1.1.0"); err != nil {
-		t.Fatal(err)
-	}
-	got := read(t, dir, "app.json")
-	if !strings.Contains(got, `"appVersion": "1.1.0"`) || !strings.Contains(got, `"version": "not-this-one"`) {
-		t.Errorf("wrong field updated: %s", got)
+	if got := st.Mode().Perm(); got != 0o600 {
+		t.Errorf("mode = %v, want 0600", got)
 	}
 }
 
-func TestJSONSourceErrors(t *testing.T) {
+func TestDescribeIsTheShorthand(t *testing.T) {
 	dir := t.TempDir()
-
-	write(t, dir, "a.json", `{"name": "x"}`)
-	s, _ := New(dir, KindJSON, "a.json", "version")
-	if _, err := s.Read(); err == nil {
-		t.Error("a missing field should be an error")
+	if got := open(t, dir, "VERSION").Describe(); got != "VERSION" {
+		t.Errorf("Describe() = %q", got)
 	}
-
-	write(t, dir, "b.json", `{"version": 3}`)
-	s, _ = New(dir, KindJSON, "b.json", "version")
-	if _, err := s.Read(); err == nil {
-		t.Error("a non-string version should be an error")
-	}
-	if err := s.Write("1.0.0"); err == nil {
-		t.Error("writing over a non-string version should be an error")
-	}
-
-	write(t, dir, "c.json", `{"version": {"major": 1}}`)
-	s, _ = New(dir, KindJSON, "c.json", "version")
-	if err := s.Write("1.0.0"); err == nil {
-		t.Error("writing over an object version should be an error")
-	}
-
-	write(t, dir, "d.json", `not json at all`)
-	s, _ = New(dir, KindJSON, "d.json", "version")
-	if _, err := s.Read(); err == nil {
-		t.Error("invalid JSON should be an error")
+	if got := open(t, dir, "package.json#version").Describe(); got != "package.json#version" {
+		t.Errorf("Describe() = %q", got)
 	}
 }
 
-func TestNewValidation(t *testing.T) {
+func TestMissingFileReportsThePath(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := New(dir, "toml", "Cargo.toml", ""); err == nil {
-		t.Error("an unknown type should be rejected")
-	}
-	if _, err := New(dir, KindFile, "", ""); err == nil {
-		t.Error("an empty path should be rejected")
-	}
-	// Rejected on every platform, not just the one whose form it is: a config
-	// file travels between machines, and filepath.IsAbs answers differently per
-	// OS ("/etc/passwd" is not absolute on Windows, `C:\x` is not on unix).
-	for _, escape := range []string{
-		"/etc/passwd",
-		`\Windows\system32\x`,
-		`C:\Windows\x`,
-		"C:relative",
-		"../outside/VERSION",
-		"nested/../../outside/VERSION",
-		`nested\..\..\outside\VERSION`,
-	} {
-		if _, err := New(dir, KindFile, escape, ""); err == nil {
-			t.Errorf("path %q should be rejected — it can resolve outside the repository", escape)
-		}
-	}
-	if _, err := New(dir, KindFile, "VERSION", "version"); err == nil {
-		t.Error("a field on a file source should be rejected")
-	}
-	if _, err := New(dir, KindJSON, "package.json", "a.b"); err == nil {
-		t.Error("a dotted field path should be rejected")
+	_, err := open(t, dir, "VERSION").Read()
+	if err == nil || !strings.Contains(err.Error(), "VERSION") {
+		t.Errorf("err = %v, want it to name the file", err)
 	}
 }

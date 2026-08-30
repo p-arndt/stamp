@@ -20,7 +20,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	// Windows will not execute a file without an executable extension, so the
-	// test binary has to carry .exe there — go build does not add it when -o
+	// test binary has to carry .exe there, because go build does not add it when -o
 	// names the output explicitly.
 	name := "stamp"
 	if runtime.GOOS == "windows" {
@@ -280,8 +280,9 @@ func TestPrereleaseCycle(t *testing.T) {
 		want string
 	}{
 		{[]string{"prerelease", "minor", "--yes"}, "0.5.0-beta.1"},
-		{[]string{"prerelease", "minor", "--yes"}, "0.5.0-beta.2"},
-		{[]string{"prerelease", "patch", "--type", "rc", "--yes"}, "0.5.0-rc.1"},
+		{[]string{"prerelease", "--yes"}, "0.5.0-beta.2"},
+		{[]string{"prerelease", "--type", "rc", "--yes"}, "0.5.0-rc.1"},
+		{[]string{"prerelease", "--yes"}, "0.5.0-rc.2"},
 		{[]string{"release", "final", "--yes"}, "0.5.0"},
 	}
 	for _, step := range steps {
@@ -296,6 +297,37 @@ func TestPrereleaseCycle(t *testing.T) {
 	// Every tag reached the remote, in order.
 	requireContains(t, r.remoteGit("tag", "--list"),
 		"v0.5.0-beta.1", "v0.5.0-beta.2", "v0.5.0-rc.1", "v0.5.0")
+}
+
+// A bump keyword always bumps, off a pre-release as much as off a stable
+// version, the same rule npm, uv and hatch follow. Which digits happen to be
+// zero makes no difference, and the bare form is the repeatable one.
+func TestPrereleaseBumpAlwaysBumps(t *testing.T) {
+	cases := []struct{ from, bump, want string }{
+		{"1.2.3", "minor", "1.3.0-beta.1"},
+		{"1.3.0-beta.1", "patch", "1.3.1-beta.1"},
+		{"1.3.0-beta.1", "minor", "1.4.0-beta.1"},
+		{"1.3.0-beta.1", "major", "2.0.0-beta.1"},
+		// The zero in the patch position used to change the answer. It no
+		// longer does.
+		{"1.3.1-beta.1", "minor", "1.4.0-beta.1"},
+		{"1.3.0-rc.4", "minor", "1.4.0-beta.1"},
+		// The bare form walks, so repeating it in a justfile is safe.
+		{"1.3.0-beta.1", "", "1.3.0-beta.2"},
+		{"1.3.1-beta.1", "", "1.3.1-beta.2"},
+	}
+	for _, c := range cases {
+		r := newRepo(t)
+		r.seed(c.from)
+		args := []string{"prerelease", "--yes", "--no-fetch"}
+		if c.bump != "" {
+			args = append(args, c.bump)
+		}
+		r.mustStamp(args...)
+		if got := strings.TrimSpace(r.read("VERSION")); got != c.want {
+			t.Errorf("%s + %q = %s, want %s", c.from, c.bump, got, c.want)
+		}
+	}
 }
 
 // Once a series is running, --type is not needed again: the identifier is
@@ -386,21 +418,16 @@ func TestReleaseUpdatesMirrorsInOneCommit(t *testing.T) {
 	r.write("VERSION", "0.4.0\n")
 	r.write("package.json", "{\n  \"version\": \"0.4.0\"\n}\n")
 	r.write(".stamp.yml", `
-project:
-  name: mirrored
+project: mirrored
 version:
-  source:
-    type: file
-    path: VERSION
-  mirrors:
-    - type: json
-      path: package.json
+  - VERSION
+  - package.json#version
 `)
 	r.commitAll("initial")
 	r.push()
 
 	out := r.mustStamp("release", "minor", "--yes")
-	requireContains(t, out, "Release mirrored", "package.json (version)")
+	requireContains(t, out, "Release mirrored", "package.json#version")
 
 	if got := r.read("VERSION"); got != "0.5.0\n" {
 		t.Errorf("VERSION = %q", got)
@@ -420,7 +447,7 @@ func TestReleaseRefusesDriftedMirror(t *testing.T) {
 	r := newRepo(t)
 	r.write("VERSION", "0.4.0\n")
 	r.write("package.json", "{\n  \"version\": \"0.1.0\"\n}\n")
-	r.write(".stamp.yml", "version:\n  source:\n    type: file\n    path: VERSION\n  mirrors:\n    - type: json\n      path: package.json\n")
+	r.write(".stamp.yml", "version:\n  - VERSION\n  - package.json#version\n")
 	r.commitAll("initial")
 	r.push()
 
@@ -572,7 +599,7 @@ func TestRollbackRestoresWrittenFiles(t *testing.T) {
 	r := newRepo(t)
 	r.write("VERSION", "0.4.0\n")
 	r.write("package.json", "{\n  \"version\": \"0.4.0\"\n}\n")
-	r.write(".stamp.yml", "version:\n  source:\n    type: file\n    path: VERSION\n  mirrors:\n    - type: json\n      path: package.json\n")
+	r.write(".stamp.yml", "version:\n  - VERSION\n  - package.json#version\n")
 	r.commitAll("initial")
 	r.push()
 	head := r.git("rev-parse", "HEAD")
@@ -599,7 +626,7 @@ func TestRollbackRestoresWrittenFiles(t *testing.T) {
 	if r.git("tag", "--list") != "" {
 		t.Error("a tag was left behind")
 	}
-	// The index must be clean too — no half-staged version bump.
+	// The index must be clean too: no half-staged version bump.
 	if staged := r.git("diff", "--cached", "--name-only"); staged != "" {
 		t.Errorf("index holds %q", staged)
 	}
@@ -619,11 +646,78 @@ func TestCurrentPrintsBareVersion(t *testing.T) {
 	}
 }
 
+// init describes the repository as it already is, and the file it writes is
+// immediately usable by the next command.
+func TestInitWritesAUsableConfig(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.write("package.json", "{\n  \"version\": \"0.4.0\"\n}\n")
+	r.commitAll("add package.json")
+
+	out := r.mustStamp("init")
+	requireContains(t, out, "Wrote .stamp.yml", "VERSION", "package.json#version", "v0.4.0")
+
+	// The package.json beside a VERSION file becomes a mirror, so a release
+	// bumps both.
+	r.commitAll("add config")
+	r.mustStamp("release", "minor", "--yes", "--no-fetch")
+	if got := strings.TrimSpace(r.read("VERSION")); got != "0.5.0" {
+		t.Errorf("VERSION = %q", got)
+	}
+	if !strings.Contains(r.read("package.json"), `"0.5.0"`) {
+		t.Errorf("package.json was not mirrored:\n%s", r.read("package.json"))
+	}
+}
+
+// A second init is refused rather than silently overwriting a hand-edited
+// config; --dry-run and --force are the ways through.
+func TestInitDoesNotOverwrite(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.mustStamp("init")
+	before := r.read(".stamp.yml")
+
+	out, code := r.stamp("init", "--name", "other")
+	if code == 0 {
+		t.Fatalf("a second init should fail:\n%s", out)
+	}
+	requireContains(t, out, "already exists")
+	if r.read(".stamp.yml") != before {
+		t.Error(".stamp.yml was overwritten by a failing init")
+	}
+
+	if out := r.mustStamp("init", "--dry-run", "--name", "other"); !strings.Contains(out, "project: other") {
+		t.Errorf("--dry-run did not print the file:\n%s", out)
+	}
+	if r.read(".stamp.yml") != before {
+		t.Error("--dry-run wrote the file")
+	}
+
+	r.mustStamp("init", "--force", "--name", "other")
+	if !strings.Contains(r.read(".stamp.yml"), "project: other") {
+		t.Error("--force did not overwrite")
+	}
+}
+
+// The repository's own branch and remote beat the defaults: a repo on another
+// branch must not be handed a config that says "main".
+func TestInitTakesBranchAndRemoteFromTheRepository(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.git("checkout", "-q", "-b", "trunk")
+
+	out := r.mustStamp("init")
+	requireContains(t, out, "trunk", "origin")
+	if !strings.Contains(r.read(".stamp.yml"), "branch: trunk") {
+		t.Errorf("branch not taken from the repository:\n%s", r.read(".stamp.yml"))
+	}
+}
+
 func TestSetWritesWithoutTouchingGit(t *testing.T) {
 	r := newRepo(t)
 	r.write("VERSION", "0.4.0\n")
 	r.write("package.json", "{\n  \"version\": \"0.4.0\"\n}\n")
-	r.write(".stamp.yml", "version:\n  source:\n    type: file\n    path: VERSION\n  mirrors:\n    - type: json\n      path: package.json\n")
+	r.write(".stamp.yml", "version:\n  - VERSION\n  - package.json#version\n")
 	r.commitAll("initial")
 	head := r.git("rev-parse", "HEAD")
 
@@ -671,7 +765,7 @@ func TestVerifyChecksMirrors(t *testing.T) {
 	r := newRepo(t)
 	r.write("VERSION", "0.5.0\n")
 	r.write("package.json", "{\n  \"version\": \"0.4.0\"\n}\n")
-	r.write(".stamp.yml", "version:\n  source:\n    type: file\n    path: VERSION\n  mirrors:\n    - type: json\n      path: package.json\n")
+	r.write(".stamp.yml", "version:\n  - VERSION\n  - package.json#version\n")
 	r.commitAll("initial")
 
 	out, code := r.stamp("verify", "--tag", "v0.5.0")
@@ -715,7 +809,7 @@ func TestUpdateCommandsRefuseDevBuild(t *testing.T) {
 }
 
 // The update commands operate on the installed binary, not on a project, so they
-// must work with no repository in sight — the failure below is the dev-build
+// must work with no repository in sight. The failure below is the dev-build
 // refusal, which proves the command ran rather than being turned away by the
 // repository lookup every other command starts with.
 func TestUpdateCommandsDoNotNeedARepository(t *testing.T) {
@@ -742,6 +836,289 @@ func TestCurrentSilentAboutUpdatesOnDevBuild(t *testing.T) {
 	out := r.mustStamp("current")
 	if strings.TrimSpace(out) != "0.4.0" {
 		t.Errorf("current printed more than the version: %q", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// components
+// ---------------------------------------------------------------------------
+
+// monorepo is two components in one repository: cli at the root, web in a
+// subdirectory, each with its own version and its own tag.
+func monorepo(t *testing.T) *repo {
+	t.Helper()
+	r := newRepo(t)
+	r.write("VERSION", "0.4.0\n")
+	r.write("web/package.json", "{\n  \"version\": \"1.0.0\"\n}\n")
+	r.write(".stamp.yml", `
+project: mono
+
+release:
+  branch: main
+  remote: origin
+  tag: "{{component}}-v{{version}}"
+
+components:
+  cli:
+    version: VERSION
+    tag: v{{version}}
+  web:
+    version: web/package.json#version
+`)
+	r.commitAll("initial")
+	r.push()
+	return r
+}
+
+// The whole point of components: releasing one leaves the other alone.
+func TestComponentReleaseTouchesOnlyItsOwnFiles(t *testing.T) {
+	r := monorepo(t)
+
+	out := r.mustStamp("release", "web", "minor", "--yes")
+	requireContains(t, out, "Release web", "web-v1.1.0")
+
+	if got := strings.TrimSpace(r.read("VERSION")); got != "0.4.0" {
+		t.Errorf("VERSION = %q, the cli component was bumped too", got)
+	}
+	if !strings.Contains(r.read("web/package.json"), `"1.1.0"`) {
+		t.Errorf("web was not bumped:\n%s", r.read("web/package.json"))
+	}
+	files := strings.Fields(r.git("show", "--name-only", "--pretty=format:", "HEAD"))
+	if len(files) != 1 || files[0] != "web/package.json" {
+		t.Errorf("the release commit touched %v, want only web/package.json", files)
+	}
+	if got := r.remoteGit("tag", "-l"); got != "web-v1.1.0" {
+		t.Errorf("tags on the remote = %q, want only web-v1.1.0", got)
+	}
+}
+
+// A component overrides only the keys it names, so cli keeps its own tag
+// template while inheriting branch and remote.
+func TestComponentTagOverrideWins(t *testing.T) {
+	r := monorepo(t)
+
+	out := r.mustStamp("release", "cli", "patch", "--yes")
+	requireContains(t, out, "v0.4.1")
+	if strings.Contains(out, "cli-v0.4.1") {
+		t.Errorf("the component override did not win:\n%s", out)
+	}
+}
+
+// Releasing without naming a component is refused, and the refusal lists the
+// names rather than making the user go and read the config.
+func TestComponentIsRequired(t *testing.T) {
+	r := monorepo(t)
+
+	out, code := r.stamp("release", "minor", "--yes")
+	if code == 0 {
+		t.Fatalf("a release without a component should fail:\n%s", out)
+	}
+	requireContains(t, out, "cli, web", "name one")
+	if got := strings.TrimSpace(r.read("VERSION")); got != "0.4.0" {
+		t.Error("something was written despite the error")
+	}
+
+	out, code = r.stamp("release", "nope", "minor", "--yes")
+	if code == 0 {
+		t.Fatalf("an unknown component should fail:\n%s", out)
+	}
+	requireContains(t, out, `"nope" is not one of them`)
+}
+
+func TestComponentCurrentAndSet(t *testing.T) {
+	r := monorepo(t)
+
+	if out := r.mustStamp("current", "web"); out != "1.0.0\n" {
+		t.Errorf("current web = %q", out)
+	}
+	if out := r.mustStamp("current", "cli"); out != "0.4.0\n" {
+		t.Errorf("current cli = %q", out)
+	}
+	if _, code := r.stamp("current"); code == 0 {
+		t.Error("current without a component should fail in a repository with components")
+	}
+
+	r.mustStamp("set", "web", "2.0.0")
+	if !strings.Contains(r.read("web/package.json"), `"2.0.0"`) {
+		t.Error("set did not write the component's file")
+	}
+	if got := strings.TrimSpace(r.read("VERSION")); got != "0.4.0" {
+		t.Error("set touched the other component")
+	}
+}
+
+// A CI job knows the tag it was triggered by and nothing else, so verify works
+// the component out from the tag.
+func TestVerifyFindsTheComponentFromTheTag(t *testing.T) {
+	r := monorepo(t)
+
+	out := r.mustStamp("verify", "--tag", "web-v1.0.0")
+	requireContains(t, out, "tag matches the committed version", "web")
+
+	if out := r.mustStamp("verify", "--tag", "v0.4.0"); !strings.Contains(out, "matches") {
+		t.Errorf("the cli tag was not recognised:\n%s", out)
+	}
+
+	out, code := r.stamp("verify", "--tag", "v9.9.9")
+	if code == 0 {
+		t.Fatalf("an unknown tag should fail:\n%s", out)
+	}
+	requireContains(t, out, "no component", "cli", "web")
+}
+
+// ---------------------------------------------------------------------------
+// version locations
+// ---------------------------------------------------------------------------
+
+// A YAML field and a nested TOML field are bumped like any other location, and
+// the rest of both files survives byte for byte.
+func TestReleaseWritesYAMLAndTOMLLocations(t *testing.T) {
+	r := newRepo(t)
+	r.write("VERSION", "0.4.0\n")
+	r.write("charts/app/Chart.yaml", "apiVersion: v2\nname: app        # the chart\nversion: 0.4.0\nappVersion: \"0.4.0\"\n")
+	r.write("pyproject.toml", "[project]\nname = \"app\"\nversion = \"0.4.0\"\n\n[tool.ruff]\nversion = \"9.9.9\"\n")
+	r.write(".stamp.yml", `
+version:
+  - VERSION
+  - charts/app/Chart.yaml#version
+  - charts/app/Chart.yaml#appVersion
+  - pyproject.toml#project.version
+`)
+	r.commitAll("initial")
+	r.push()
+
+	// The same file twice, under two different fields, is a legitimate layout.
+	out, code := r.stamp("release", "minor", "--yes")
+	if code == 0 {
+		t.Fatalf("the same path listed twice should be refused:\n%s", out)
+	}
+	requireContains(t, out, "already listed")
+
+	r.write(".stamp.yml", `
+version:
+  - VERSION
+  - charts/app/Chart.yaml#appVersion
+  - pyproject.toml#project.version
+`)
+	r.commitAll("fix config")
+	r.mustStamp("release", "minor", "--yes")
+
+	if got := r.read("charts/app/Chart.yaml"); !strings.Contains(got, `appVersion: "0.5.0"`) ||
+		!strings.Contains(got, "# the chart") || !strings.Contains(got, "version: 0.4.0") {
+		t.Errorf("Chart.yaml was not edited surgically:\n%s", got)
+	}
+	if got := r.read("pyproject.toml"); !strings.Contains(got, "version = \"0.5.0\"") ||
+		!strings.Contains(got, "version = \"9.9.9\"") {
+		t.Errorf("pyproject.toml was not edited surgically:\n%s", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// config compatibility
+// ---------------------------------------------------------------------------
+
+// The superseded source/mirrors shape keeps working, and says so once, on
+// stderr, so a piped `stamp current` is unaffected.
+func TestLegacyConfigStillReleasesWithANotice(t *testing.T) {
+	r := newRepo(t)
+	r.write("VERSION", "0.4.0\n")
+	r.write("package.json", "{\n  \"version\": \"0.4.0\"\n}\n")
+	r.write(".stamp.yml", `
+project:
+  name: legacy
+version:
+  source:
+    type: file
+    path: VERSION
+  mirrors:
+    - type: json
+      path: package.json
+      field: version
+`)
+	r.commitAll("initial")
+	r.push()
+
+	out := r.mustStamp("release", "minor", "--yes")
+	requireContains(t, out, "still uses version.source", "stamp migrate", "Release legacy")
+	if got := strings.TrimSpace(r.read("VERSION")); got != "0.5.0" {
+		t.Errorf("VERSION = %q, the superseded shape stopped working", got)
+	}
+}
+
+// migrate rewrites the old shape into the list form, saying the same thing.
+func TestMigrateRewritesTheConfig(t *testing.T) {
+	r := newRepo(t)
+	r.write("VERSION", "0.4.0\n")
+	r.write("package.json", "{\n  \"version\": \"0.4.0\"\n}\n")
+	r.write(".stamp.yml", `
+project:
+  name: legacy
+version:
+  source:
+    type: file
+    path: VERSION
+  mirrors:
+    - type: json
+      path: package.json
+release:
+  branch: trunk
+  tag: "{{version}}"
+  push: false
+`)
+	r.commitAll("initial")
+
+	r.mustStamp("migrate")
+	config := r.read(".stamp.yml")
+	requireContains(t, config, "project: legacy", "  - VERSION", "  - package.json#version",
+		"branch: trunk", `tag: "{{version}}"`, "push: false")
+	if strings.Contains(config, "mirrors:") {
+		t.Errorf("the superseded shape survived:\n%s", config)
+	}
+
+	// Everything it said before, it still says.
+	r.commitAll("migrate")
+	out := r.mustStamp("release", "minor", "--yes", "--no-fetch", "--branch", "main")
+	if strings.Contains(out, "still uses version.source") {
+		t.Error("the migrated config is still reported as superseded")
+	}
+	requireContains(t, out, "Release legacy", "0.5.0")
+
+	if _, code := r.stamp("migrate"); code == 0 {
+		t.Error("migrating an already-current config should fail")
+	}
+}
+
+// init in a monorepo proposes components, one per directory, each tagged apart.
+func TestInitWritesComponents(t *testing.T) {
+	r := newRepo(t)
+	r.write("VERSION", "0.4.0\n")
+	r.write("web/package.json", "{\n  \"version\": \"1.0.0\"\n}\n")
+	r.commitAll("initial")
+
+	out := r.mustStamp("init", "--yes")
+	requireContains(t, out, "Wrote .stamp.yml", "Component", "web", "web-v1.0.0")
+
+	config := r.read(".stamp.yml")
+	requireContains(t, config, "components:", "  web:", "web/package.json#version", "{{component}}")
+
+	r.commitAll("add config")
+	r.mustStamp("release", "web", "minor", "--yes", "--no-fetch")
+	if !strings.Contains(r.read("web/package.json"), `"1.1.0"`) {
+		t.Error("the config init wrote does not release")
+	}
+}
+
+// --file replaces detection outright, so a project stamp cannot guess still
+// gets a config in one command.
+func TestInitWithExplicitFiles(t *testing.T) {
+	r := newRepo(t)
+	r.write("app/Chart.yaml", "apiVersion: v2\nappVersion: 0.4.0\n")
+	r.commitAll("initial")
+
+	out := r.mustStamp("init", "--yes", "--file", "app/Chart.yaml#appVersion")
+	requireContains(t, out, "app/Chart.yaml#appVersion", "0.4.0")
+	if !strings.Contains(r.read(".stamp.yml"), "app/Chart.yaml#appVersion") {
+		t.Errorf("the location was not written:\n%s", r.read(".stamp.yml"))
 	}
 }
 

@@ -1,67 +1,191 @@
 // Package source reads and writes the places a project keeps its version.
 //
-// Two kinds are supported: a plain text file (the VERSION-file convention) and
-// a JSON field (package.json). Writing is deliberately surgical — a JSON file
-// is edited in place by replacing just the version literal, never by
-// re-marshalling it, because a marshal round-trip would reformat the whole file
-// (key order, indentation, tabs vs spaces) and bury the version bump in a
-// hundred-line diff.
+// Four kinds are supported: a plain text file (the VERSION-file convention) and
+// a field inside a JSON, YAML or TOML document. Writing is deliberately
+// surgical: the file is edited in place by replacing just the version literal,
+// never by re-marshalling it, because a marshal round-trip would reformat the
+// whole file (key order, indentation, comments, tabs vs spaces) and bury the
+// version bump in a hundred-line diff.
+//
+// In .stamp.yml a location is usually written in its shorthand form,
+// "path#field":
+//
+//	VERSION                          a plain text file
+//	package.json#version             a JSON field
+//	charts/app/Chart.yaml#appVersion a YAML field
+//	pyproject.toml#project.version   a nested TOML field
+//
+// The kind follows from the extension, so it almost never has to be spelled
+// out; ParseSpec and Spec.Normalize do that resolution.
 package source
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
-// Kinds of version source, as they appear in .stamp.yml.
+// Kinds of version location, as they may appear in .stamp.yml.
 const (
 	KindFile = "file"
 	KindJSON = "json"
+	KindYAML = "yaml"
+	KindTOML = "toml"
 )
+
+// DefaultField is the field name assumed for a structured file whose shorthand
+// names no field: package.json means package.json#version.
+const DefaultField = "version"
 
 // Source is one place a version is stored.
 type Source interface {
-	// Path is the source's path relative to the repository root.
+	// Path is the location's path relative to the repository root.
 	Path() string
 	// Read returns the version currently stored there.
 	Read() (string, error)
 	// Write stores version, preserving the rest of the file byte for byte.
 	Write(version string) error
-	// Describe renders the source for the plan output, e.g.
-	// "package.json (version)".
+	// Describe renders the location the way it is written in the config, e.g.
+	// "package.json#version".
 	Describe() string
 }
 
-// New builds a Source. root is the repository root; path is relative to it.
-// field is only meaningful for the JSON kind and defaults to "version".
-func New(root, kind, path, field string) (Source, error) {
-	if path == "" {
-		return nil, fmt.Errorf("version source of type %q needs a path", kind)
+// Spec is one version location in its declarative form: what the config says,
+// before it is bound to a repository root.
+type Spec struct {
+	// Path is relative to the repository root.
+	Path string
+	// Type is one of the Kind constants. Empty means "derive from the path".
+	Type string
+	// Field is a dot-separated path into a structured document. Empty means
+	// the kind's default, and is meaningless for KindFile.
+	Field string
+}
+
+// ParseSpec reads the shorthand form "path#field". The part after the first
+// "#" is the field path; a path with no "#" names no field.
+//
+// The first "#" wins rather than the last, because a field path may not contain
+// one but a file name theoretically could, and splitting early gives the
+// clearer error either way.
+func ParseSpec(s string) (Spec, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return Spec{}, fmt.Errorf("empty version location")
 	}
-	if err := checkRelative(path); err != nil {
+	path, field, hasField := strings.Cut(s, "#")
+	if path == "" {
+		return Spec{}, fmt.Errorf("%q names a field but no file", s)
+	}
+	if hasField && field == "" {
+		return Spec{}, fmt.Errorf("%q ends in \"#\"; write the field after it, or drop the \"#\"", s)
+	}
+	return Spec{Path: path, Field: field}, nil
+}
+
+// Shorthand renders a spec back into its "path#field" form, for `stamp init`
+// and for error messages.
+func (s Spec) Shorthand() string {
+	if s.Field == "" {
+		return s.Path
+	}
+	return s.Path + "#" + s.Field
+}
+
+// NeedsType reports whether the spec's kind cannot be derived from its path, so
+// `stamp init` knows when it has to write an explicit type.
+func (s Spec) NeedsType() bool {
+	return s.Type != "" && s.Type != KindOf(s.Path)
+}
+
+// Normalize resolves Type and Field to their effective values and rejects the
+// combinations that cannot mean anything.
+func (s Spec) Normalize() (Spec, error) {
+	if err := checkRelative(s.Path); err != nil {
+		return Spec{}, err
+	}
+	if s.Type == "" {
+		s.Type = KindOf(s.Path)
+	}
+	switch s.Type {
+	case KindFile:
+		if s.Field != "" {
+			return Spec{}, fmt.Errorf("%s holds nothing but the version, so it has no field %q; drop the \"#%s\", or set an explicit type", s.Path, s.Field, s.Field)
+		}
+	case KindJSON, KindYAML, KindTOML:
+		if s.Field == "" {
+			s.Field = DefaultField
+		}
+		if err := checkField(s.Field); err != nil {
+			return Spec{}, err
+		}
+	default:
+		return Spec{}, fmt.Errorf("unknown type %q; use %s, %s, %s or %s",
+			s.Type, KindFile, KindJSON, KindYAML, KindTOML)
+	}
+	return s, nil
+}
+
+// KindOf names the kind implied by a path's extension. Anything unrecognised is
+// a plain text file, which is what a bare "VERSION" is.
+func KindOf(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".json":
+		return KindJSON
+	case ".yaml", ".yml":
+		return KindYAML
+	case ".toml":
+		return KindTOML
+	default:
+		return KindFile
+	}
+}
+
+// New binds a spec to a repository root. The spec is normalized first, so a
+// caller may pass one straight from the config.
+func New(root string, s Spec) (Source, error) {
+	spec, err := s.Normalize()
+	if err != nil {
 		return nil, err
 	}
-
-	switch kind {
+	base := base{root: root, rel: spec.Path, field: spec.Field, shown: spec.Shorthand()}
+	switch spec.Type {
 	case KindFile:
-		if field != "" {
-			return nil, fmt.Errorf("version source %q is of type file and does not take a field", path)
-		}
-		return &fileSource{root: root, rel: path}, nil
+		return &fileSource{base}, nil
 	case KindJSON:
-		if field == "" {
-			field = "version"
-		}
-		if strings.Contains(field, ".") {
-			return nil, fmt.Errorf("field %q: only top-level JSON fields are supported", field)
-		}
-		return &jsonSource{root: root, rel: path, field: field}, nil
-	default:
-		return nil, fmt.Errorf("unknown version source type %q (use %q or %q)", kind, KindFile, KindJSON)
+		return &jsonSource{base}, nil
+	case KindYAML:
+		return &yamlSource{base}, nil
+	case KindTOML:
+		return &tomlSource{base}, nil
 	}
+	return nil, fmt.Errorf("unknown type %q", spec.Type)
+}
+
+// base is the state every kind shares.
+type base struct {
+	root  string
+	rel   string
+	field string
+	shown string
+}
+
+func (b base) Path() string     { return b.rel }
+func (b base) Describe() string { return b.shown }
+func (b base) abs() string      { return filepath.Join(b.root, b.rel) }
+
+// keys splits the field path into its segments.
+func (b base) keys() []string { return strings.Split(b.field, ".") }
+
+// checkField rejects field paths that cannot be walked.
+func checkField(field string) error {
+	for _, part := range strings.Split(field, ".") {
+		if strings.TrimSpace(part) == "" {
+			return fmt.Errorf("field path %q has an empty segment; write it as \"a.b\"", field)
+		}
+	}
+	return nil
 }
 
 // checkRelative rejects any path that could resolve outside the repository.
@@ -72,8 +196,11 @@ func New(root, kind, path, field string) (Source, error) {
 // both forms are rejected everywhere, along with "..", which would walk out of
 // the repository the long way round.
 func checkRelative(path string) error {
+	if path == "" {
+		return fmt.Errorf("a version location needs a path")
+	}
 	bad := func(why string) error {
-		return fmt.Errorf("version source path %q %s — it must be relative to the repository root", path, why)
+		return fmt.Errorf("version location %q %s; it must be relative to the repository root", path, why)
 	}
 
 	if filepath.IsAbs(path) || strings.HasPrefix(path, "/") || strings.HasPrefix(path, `\`) {
@@ -91,181 +218,22 @@ func checkRelative(path string) error {
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// file
-// ---------------------------------------------------------------------------
-
-type fileSource struct {
-	root, rel string
+// writeKeepingMode replaces a file's contents without changing its permissions.
+// A version file may well be executable or group-writable for reasons that have
+// nothing to do with stamp, and a release should not quietly reset that.
+func writeKeepingMode(path string, data []byte) error {
+	mode := os.FileMode(0o644)
+	if st, err := os.Stat(path); err == nil {
+		mode = st.Mode().Perm()
+	}
+	return os.WriteFile(path, data, mode)
 }
 
-func (s *fileSource) Path() string     { return s.rel }
-func (s *fileSource) Describe() string { return s.rel }
-func (s *fileSource) abs() string      { return filepath.Join(s.root, s.rel) }
-
-func (s *fileSource) Read() (string, error) {
-	b, err := os.ReadFile(s.abs())
-	if err != nil {
-		return "", err
-	}
-	v := strings.TrimSpace(string(b))
-	if v == "" {
-		return "", fmt.Errorf("%s is empty", s.rel)
-	}
-	if strings.ContainsAny(v, "\r\n") {
-		return "", fmt.Errorf("%s holds more than one line — a version file must contain only the version", s.rel)
-	}
-	return v, nil
-}
-
-// Write replaces the file's contents, keeping whatever trailing newline
-// convention it already had so the diff is one line either way.
-func (s *fileSource) Write(version string) error {
-	trailing := ""
-	if old, err := os.ReadFile(s.abs()); err == nil && strings.HasSuffix(string(old), "\n") {
-		trailing = "\n"
-	}
-	return os.WriteFile(s.abs(), []byte(version+trailing), 0o644)
-}
-
-// ---------------------------------------------------------------------------
-// json
-// ---------------------------------------------------------------------------
-
-type jsonSource struct {
-	root, rel, field string
-}
-
-func (s *jsonSource) Path() string     { return s.rel }
-func (s *jsonSource) Describe() string { return fmt.Sprintf("%s (%s)", s.rel, s.field) }
-func (s *jsonSource) abs() string      { return filepath.Join(s.root, s.rel) }
-
-// Read decodes the top level with encoding/json, which both validates the file
-// and unquotes the value properly.
-func (s *jsonSource) Read() (string, error) {
-	b, err := os.ReadFile(s.abs())
-	if err != nil {
-		return "", err
-	}
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal(b, &top); err != nil {
-		return "", fmt.Errorf("%s is not a JSON object: %w", s.rel, err)
-	}
-	raw, ok := top[s.field]
-	if !ok {
-		return "", fmt.Errorf("%s has no top-level %q field", s.rel, s.field)
-	}
-	var v string
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return "", fmt.Errorf("%s: %q is not a string", s.rel, s.field)
-	}
-	if strings.TrimSpace(v) == "" {
-		return "", fmt.Errorf("%s: %q is empty", s.rel, s.field)
-	}
-	return strings.TrimSpace(v), nil
-}
-
-func (s *jsonSource) Write(version string) error {
-	b, err := os.ReadFile(s.abs())
-	if err != nil {
-		return err
-	}
-	start, end, err := locateStringValue(b, s.field)
-	if err != nil {
-		return fmt.Errorf("%s: %w", s.rel, err)
-	}
-	// The version is escaped as JSON so a value needing escapes can never
-	// produce a broken file. In practice a semver string escapes to itself.
-	quoted, err := json.Marshal(version)
-	if err != nil {
-		return err
-	}
-	out := make([]byte, 0, len(b)+len(quoted))
+// splice replaces b[start:end] with replacement.
+func splice(b []byte, start, end int, replacement []byte) []byte {
+	out := make([]byte, 0, len(b)-(end-start)+len(replacement))
 	out = append(out, b[:start]...)
-	out = append(out, quoted...)
+	out = append(out, replacement...)
 	out = append(out, b[end:]...)
-	return os.WriteFile(s.abs(), out, 0o644)
-}
-
-// locateStringValue finds the byte span of the quoted string value belonging to
-// a top-level key, including its surrounding quotes.
-//
-// This is a minimal JSON scanner rather than a regexp: a regexp for
-// `"version"\s*:\s*"…"` would happily match a nested dependency entry that
-// happens to have a "version" key, and would rewrite the wrong line.
-func locateStringValue(b []byte, field string) (start, end int, err error) {
-	const (
-		expectKey = iota
-		expectValue
-	)
-	depth, state := 0, expectKey
-	// pending: the key just read at depth 1 is the one we want, so the next
-	// value token is its value. seen: the key exists but its value is not a
-	// string — worth a different error message.
-	pending, seen := false, false
-
-	for i := 0; i < len(b); i++ {
-		switch b[i] {
-		case '{', '[':
-			depth++
-			if depth == 2 && pending {
-				// The wanted key's value is an object or array.
-				pending, seen = false, true
-			}
-			if depth == 1 {
-				state = expectKey
-			}
-		case '}', ']':
-			depth--
-		case ',':
-			if depth == 1 {
-				if pending {
-					// A scalar that was not a string (number, bool, null).
-					pending, seen = false, true
-				}
-				state = expectKey
-			}
-		case ':':
-			if depth == 1 {
-				state = expectValue
-			}
-		case '"':
-			tokStart := i
-			i, err = skipString(b, i)
-			if err != nil {
-				return 0, 0, err
-			}
-			if depth != 1 {
-				continue
-			}
-			if state == expectKey {
-				var key string
-				// Reset on every depth-1 key, so a non-matching key can never
-				// leave a stale pending behind and hijack a later value.
-				pending = json.Unmarshal(b[tokStart:i+1], &key) == nil && key == field
-				continue
-			}
-			if pending {
-				return tokStart, i + 1, nil
-			}
-		}
-	}
-	if pending || seen {
-		return 0, 0, fmt.Errorf("%q is not a string value", field)
-	}
-	return 0, 0, fmt.Errorf("no top-level %q field found", field)
-}
-
-// skipString returns the index of the closing quote of the string starting at
-// the opening quote i.
-func skipString(b []byte, i int) (int, error) {
-	for j := i + 1; j < len(b); j++ {
-		switch b[j] {
-		case '\\':
-			j++ // skip the escaped byte
-		case '"':
-			return j, nil
-		}
-	}
-	return 0, fmt.Errorf("unterminated string in JSON")
+	return out
 }

@@ -1,7 +1,7 @@
 // Package ui renders stamp's terminal output: the release plan, the preflight
 // check list, and the confirmation prompt.
 //
-// Everything here writes plain lines with lipgloss styling. There is no TUI —
+// Everything here writes plain lines with lipgloss styling. There is no TUI:
 // a release is a one-shot, scriptable operation, and its output has to stay
 // readable when it is piped into a log or a CI job.
 package ui
@@ -95,20 +95,64 @@ func Hint(format string, a ...any) {
 	fmt.Fprintf(Err, "  %s\n", dimStyle.Render(fmt.Sprintf(format, a...)))
 }
 
+// Interactive reports whether stdin is a terminal, i.e. whether there is
+// anybody there to answer a question.
+func Interactive() bool {
+	return isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
+}
+
 // Confirm asks a yes/no question, defaulting to no. It reports an error when
 // stdin is not a terminal: a release must never proceed on an unanswered
 // prompt just because nobody was there to answer it.
 func Confirm(question string) (bool, error) {
-	if !isatty.IsTerminal(os.Stdin.Fd()) && !isatty.IsCygwinTerminal(os.Stdin.Fd()) {
-		return false, fmt.Errorf("not a terminal — pass --yes to confirm non-interactively")
+	if !Interactive() {
+		return false, fmt.Errorf("not a terminal, pass --yes to confirm non-interactively")
 	}
-	fmt.Fprintf(Out, "\n%s %s ", question, dimStyle.Render("[y/N]"))
+	return ConfirmDefault(question, false)
+}
+
+// ConfirmDefault asks a yes/no question with the given default, for the
+// questions `stamp init` asks. Unlike Confirm it does not insist on a terminal;
+// a caller that has no terminal simply gets the default, which is what makes
+// `stamp init` usable in a script.
+func ConfirmDefault(question string, def bool) (bool, error) {
+	hint := "[y/N]"
+	if def {
+		hint = "[Y/n]"
+	}
+	if !Interactive() {
+		return def, nil
+	}
+	fmt.Fprintf(Out, "\n%s %s ", question, dimStyle.Render(hint))
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil && line == "" {
-		return false, nil // EOF (e.g. ctrl-d) counts as "no".
+		return def, nil // EOF (e.g. ctrl-d) takes the default.
 	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes", nil
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true, nil
+	case "n", "no":
+		return false, nil
+	default:
+		return def, nil
+	}
+}
+
+// Ask puts a free-text question with a default, and returns the default when
+// the answer is empty or nobody is there to type one.
+func Ask(question, def string) string {
+	if !Interactive() {
+		return def
+	}
+	fmt.Fprintf(Out, "%s %s ", question, dimStyle.Render("["+def+"]"))
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return def
+	}
+	if answer := strings.TrimSpace(line); answer != "" {
+		return answer
+	}
+	return def
 }
 
 func pad(s string, width int) string {

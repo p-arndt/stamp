@@ -71,22 +71,24 @@ func TestResolvePre(t *testing.T) {
 		{"1.2.3", "minor", "beta", "1.3.0-beta.1"},
 		{"1.2.3", "major", "beta", "2.0.0-beta.1"},
 		{"1.2.3", "patch", "", "1.2.4-beta.1"}, // the default identifier
-		// Mid-series the base stays put and only the counter moves — the base
-		// was never released, so there is nothing to bump past.
-		{"1.2.4-beta.1", "patch", "beta", "1.2.4-beta.2"},
-		{"1.3.0-beta.1", "minor", "beta", "1.3.0-beta.2"},
-		{"1.3.0-beta.9", "patch", "beta", "1.3.0-beta.10"},
-		{"2.0.0-beta.1", "major", "beta", "2.0.0-beta.2"},
-		// A base that does not satisfy the requested bump escalates.
-		{"1.2.4-beta.1", "minor", "beta", "1.3.0-beta.1"},
+		// A bump always bumps, off a pre-release too: the pre-release is
+		// stripped and the keyword applied to what is left. These are the same
+		// numbers npm's prepatch/preminor/premajor and uv's --bump produce.
+		{"1.3.0-beta.1", "patch", "beta", "1.3.1-beta.1"},
+		{"1.3.0-beta.1", "minor", "beta", "1.4.0-beta.1"},
 		{"1.3.0-beta.1", "major", "beta", "2.0.0-beta.1"},
-		// A new identifier restarts the counter on the same base.
-		{"1.3.0-beta.2", "patch", "rc", "1.3.0-rc.1"},
-		// A pre-release without a counter is treated as .0.
-		{"1.3.0-beta", "patch", "beta", "1.3.0-beta.1"},
-		// No bump at all: the next candidate of the running series.
+		// And it does not depend on which digits happen to be zero.
+		{"1.3.1-beta.1", "minor", "beta", "1.4.0-beta.1"},
+		{"1.3.0-beta.9", "patch", "beta", "1.3.1-beta.1"},
+		{"2.0.0-beta.1", "major", "beta", "3.0.0-beta.1"},
+		// The bare form is the one that walks the running series.
 		{"1.3.0-beta.1", "", "beta", "1.3.0-beta.2"},
+		{"1.3.0-beta.9", "", "beta", "1.3.0-beta.10"},
 		{"1.2.4-rc.7", "", "rc", "1.2.4-rc.8"},
+		// A new identifier restarts the counter on the same base.
+		{"1.3.0-beta.2", "", "rc", "1.3.0-rc.1"},
+		// A pre-release without a counter is treated as .0.
+		{"1.3.0-beta", "", "beta", "1.3.0-beta.1"},
 	}
 	for _, c := range cases {
 		got, err := ResolvePre(c.current, c.kind, c.id)
@@ -105,7 +107,7 @@ func TestResolvePreRejects(t *testing.T) {
 	// a legal semver pre-release.
 	for _, c := range []struct{ kind, id string }{
 		{"1.3.0", "beta"},
-		{"", "beta"}, // 1.2.3 is stable — there is no series to continue
+		{"", "beta"}, // 1.2.3 is stable, so there is no series to continue
 		{"nonsense", "beta"},
 		{"patch", "beta 1"},
 		{"patch", "beta_1"},
@@ -144,14 +146,15 @@ func TestContinuesSeries(t *testing.T) {
 		current, kind string
 		want          bool
 	}{
-		{"1.3.0-rc.1", "patch", true},
-		{"1.3.0-rc.1", "minor", true},  // the base is a minor version already
-		{"1.3.0-rc.1", "major", false}, // 2.0.0 is a new series
-		{"1.2.4-beta.1", "minor", false},
-		{"1.2.3", "patch", false}, // no series to continue
-		{"1.3.0-rc.1", "", true},  // a bare `stamp prerelease` continues it
-		{"1.2.3", "", false},
-		{"nonsense", "patch", false},
+		{"1.3.0-rc.1", "", true}, // a bare `stamp prerelease` continues it
+		{"1.2.4-beta.1", "", true},
+		{"1.2.3", "", false}, // no series to continue
+		// Any bump opens a series for a different release, so it takes the
+		// configured identifier rather than inheriting this one.
+		{"1.3.0-rc.1", "patch", false},
+		{"1.3.0-rc.1", "minor", false},
+		{"1.3.0-rc.1", "major", false},
+		{"nonsense", "", false},
 	}
 	for _, c := range cases {
 		if got := ContinuesSeries(c.current, c.kind); got != c.want {

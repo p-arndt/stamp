@@ -9,9 +9,30 @@ import (
 
 func write(t *testing.T, dir, name, content string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// load writes a .stamp.yml and reads it back the way stamp would.
+func load(t *testing.T, dir, yaml string) *Config {
+	t.Helper()
+	write(t, dir, FileName, yaml)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v\n%s", err, yaml)
+	}
+	return cfg
+}
+
+func loadErr(t *testing.T, dir, yaml string) error {
+	t.Helper()
+	write(t, dir, FileName, yaml)
+	_, err := Load(dir)
+	return err
 }
 
 // Without a config file, a VERSION-file repo must work as-is: main, v-prefixed
@@ -27,20 +48,27 @@ func TestDetectVersionFile(t *testing.T) {
 	if cfg.FromFile {
 		t.Error("FromFile should be false when there is no .stamp.yml")
 	}
-	if cfg.Source.Path() != "VERSION" {
-		t.Errorf("source = %q, want VERSION", cfg.Source.Path())
+	if cfg.Multi {
+		t.Error("a detected repository has no components")
 	}
-	if cfg.Branch != "main" || cfg.Remote != "origin" || !cfg.Push {
-		t.Errorf("defaults wrong: branch=%q remote=%q push=%v", cfg.Branch, cfg.Remote, cfg.Push)
+	comp := cfg.Only()
+	if comp.Source().Path() != "VERSION" {
+		t.Errorf("source = %q, want VERSION", comp.Source().Path())
 	}
-	if got := cfg.RenderTag("0.5.0"); got != "v0.5.0" {
+	if comp.Branch != "main" || comp.Remote != "origin" || !comp.Push {
+		t.Errorf("defaults wrong: branch=%q remote=%q push=%v", comp.Branch, comp.Remote, comp.Push)
+	}
+	if got := comp.RenderTag("0.5.0"); got != "v0.5.0" {
 		t.Errorf("RenderTag = %q, want v0.5.0", got)
 	}
-	if got := cfg.RenderCommit("0.5.0", "v0.5.0"); got != "release: v0.5.0" {
+	if got := comp.RenderCommit("0.5.0", "v0.5.0"); got != "release: v0.5.0" {
 		t.Errorf("RenderCommit = %q", got)
 	}
 	if cfg.ProjectName != filepath.Base(dir) {
 		t.Errorf("ProjectName = %q, want the directory name", cfg.ProjectName)
+	}
+	if comp.Label() != filepath.Base(dir) {
+		t.Errorf("Label() = %q, want the project name", comp.Label())
 	}
 }
 
@@ -55,41 +83,225 @@ func TestDetectPrefersVersionFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Source.Path() != "VERSION" {
-		t.Errorf("source = %q, want VERSION", cfg.Source.Path())
-	}
-	// It is not silently mirrored, though — that has to be asked for.
-	if len(cfg.Mirrors) != 0 {
-		t.Errorf("detected %d mirrors, want none", len(cfg.Mirrors))
+	if got := cfg.Only().Source().Path(); got != "VERSION" {
+		t.Errorf("source = %q, want VERSION", got)
 	}
 }
 
 func TestDetectPackageJSON(t *testing.T) {
 	dir := t.TempDir()
-	write(t, dir, "package.json", `{"version": "1.0.0"}`)
+	write(t, dir, "package.json", `{"version": "0.4.0"}`)
 
 	cfg, err := Load(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Source.Path() != "package.json" {
-		t.Errorf("source = %q, want package.json", cfg.Source.Path())
+	if got := cfg.Only().Source().Describe(); got != "package.json#version" {
+		t.Errorf("source = %q", got)
 	}
 }
 
 func TestDetectNothingFound(t *testing.T) {
 	if _, err := Load(t.TempDir()); err == nil {
-		t.Fatal("a repository with no version file should be an error")
-	} else if !strings.Contains(err.Error(), FileName) {
-		t.Errorf("the error should point at %s, got: %v", FileName, err)
+		t.Error("a repository with no version file should be an error")
 	}
 }
 
-func TestLoadFull(t *testing.T) {
+// The shape the README documents, read back key by key.
+func TestLoadList(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "VERSION", "0.4.0")
+	cfg := load(t, dir, `
+project: hop
+
+version:
+  - VERSION
+  - package.json#version
+  - charts/app/Chart.yaml#appVersion
+
+release:
+  branch: release
+  remote: upstream
+  tag: "{{ version }}"
+  commit: "chore: {{version}} ({{tag}})"
+  push: false
+  prerelease: rc
+`)
+
+	if cfg.ProjectName != "hop" {
+		t.Errorf("ProjectName = %q", cfg.ProjectName)
+	}
+	comp := cfg.Only()
+	want := []string{"VERSION", "package.json#version", "charts/app/Chart.yaml#appVersion"}
+	var got []string
+	for _, s := range comp.Sources {
+		got = append(got, s.Describe())
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("sources = %v, want %v", got, want)
+	}
+	if comp.Branch != "release" || comp.Remote != "upstream" || comp.Push {
+		t.Errorf("release block not applied: %+v", comp)
+	}
+	if comp.PreID != "rc" {
+		t.Errorf("PreID = %q", comp.PreID)
+	}
+	if got := comp.RenderTag("1.0.0"); got != "1.0.0" {
+		t.Errorf("RenderTag = %q", got)
+	}
+	if got := comp.RenderCommit("1.0.0", "1.0.0"); got != "chore: 1.0.0 (1.0.0)" {
+		t.Errorf("RenderCommit = %q", got)
+	}
+}
+
+// A single location may be written without the list, which is what a one-file
+// component looks like.
+func TestLoadSingleVersionScalar(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "web/package.json", `{"version": "0.4.0"}`)
+	cfg := load(t, dir, "version: web/package.json#version\n")
+	if got := cfg.Only().Source().Describe(); got != "web/package.json#version" {
+		t.Errorf("source = %q", got)
+	}
+}
+
+// The written-out form is still accepted, for a path that needs an explicit
+// type.
+func TestLoadWrittenOutEntry(t *testing.T) {
+	dir := t.TempDir()
+	cfg := load(t, dir, `
+version:
+  - path: version.conf
+    type: yaml
+    field: app.version
+`)
+	if got := cfg.Only().Source().Describe(); got != "version.conf#app.version" {
+		t.Errorf("source = %q", got)
+	}
+}
+
+// A config that configures the release but not the version falls back to
+// detection, so `release:` alone is a useful file.
+func TestLoadPartialConfigDetectsSource(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "VERSION", "0.4.0\n")
-	write(t, dir, "package.json", `{"version": "0.4.0"}`)
-	write(t, dir, FileName, `
+	cfg := load(t, dir, "release:\n  branch: develop\n")
+	if got := cfg.Only().Source().Path(); got != "VERSION" {
+		t.Errorf("source = %q, want the detected VERSION", got)
+	}
+	if cfg.Only().Branch != "develop" {
+		t.Error("release.branch was not applied")
+	}
+}
+
+func TestComponents(t *testing.T) {
+	dir := t.TempDir()
+	cfg := load(t, dir, `
+project: mono
+
+release:
+  branch: main
+  remote: origin
+  prerelease: rc
+  tag: "{{component}}-v{{version}}"
+
+components:
+  cli:
+    version:
+      - VERSION
+      - package.json#version
+    tag: v{{version}}
+  web:
+    version: web/package.json#version
+    branch: web-release
+    push: false
+`)
+	if !cfg.Multi {
+		t.Fatal("Multi should be true")
+	}
+	if got := strings.Join(cfg.Names(), ","); got != "cli,web" {
+		t.Errorf("Names() = %q, want the file's order", got)
+	}
+
+	cli := cfg.Lookup("cli")
+	if cli == nil {
+		t.Fatal("cli not found")
+	}
+	if got := cli.RenderTag("1.2.0"); got != "v1.2.0" {
+		t.Errorf("cli tag = %q, the component override did not win", got)
+	}
+	if len(cli.Sources) != 2 || cli.Mirrors()[0].Describe() != "package.json#version" {
+		t.Errorf("cli sources = %v", cli.Paths())
+	}
+	if cli.Branch != "main" || cli.Remote != "origin" || cli.PreID != "rc" || !cli.Push {
+		t.Errorf("cli did not inherit the release block: %+v", cli)
+	}
+	if cli.Label() != "cli" {
+		t.Errorf("Label() = %q", cli.Label())
+	}
+
+	web := cfg.Lookup("web")
+	if got := web.RenderTag("1.2.0"); got != "web-v1.2.0" {
+		t.Errorf("web tag = %q, {{component}} was not expanded", got)
+	}
+	if web.Branch != "web-release" {
+		t.Errorf("web branch = %q, the override did not win", web.Branch)
+	}
+	if web.Push {
+		t.Error("web push override did not win")
+	}
+	if web.Remote != "origin" || web.PreID != "rc" {
+		t.Error("web should still inherit the keys it did not name")
+	}
+}
+
+func TestLoadRejects(t *testing.T) {
+	tests := []struct{ name, yaml, want string }{
+		{"unknown top-level key", "versions:\n  - VERSION\n", "unknown key"},
+		{"unknown release key", "version: VERSION\nrelease:\n  brunch: main\n", "unknown key"},
+		{"unknown component key", "components:\n  a:\n    version: VERSION\n    tagg: x\n", "unknown key"},
+		{"typo in the tag placeholder", "version: VERSION\nrelease:\n  tag: \"v{{ vesion }}\"\n", "unknown placeholder"},
+		{"tag without a version", "version: VERSION\nrelease:\n  tag: \"release\"\n", "{{ version }}"},
+		{"commit without a placeholder", "version: VERSION\nrelease:\n  commit: \"bump\"\n", "no placeholder"},
+		{"the same file twice", "version:\n  - VERSION\n  - VERSION\n", "already listed"},
+		{"an absolute path", "version: /etc/passwd\n", "absolute"},
+		{"a path walking out", "version: ../other/VERSION\n", "walks up"},
+		{"a component and a top-level version", "version: VERSION\ncomponents:\n  a:\n    version: A\n", "inside each component"},
+		{"a component without a version", "components:\n  a:\n    tag: v{{version}}\n", "has no version"},
+		{"an empty components block", "components: {}\n", "name at least one"},
+		{"a component named after a bump", "components:\n  minor:\n    version: VERSION\n", "bump keyword"},
+		{"a component name with capitals", "components:\n  Web:\n    version: VERSION\n", "lowercase"},
+		{"two components claiming one file", "components:\n  a:\n    version: VERSION\n    tag: a-v{{version}}\n  b:\n    version: VERSION\n    tag: b-v{{version}}\n", "cannot hold two versions"},
+		{"two components with one tag", "components:\n  a:\n    version: A\n  b:\n    version: B\n", "would both tag"},
+		{"{{component}} without components", "version: VERSION\nrelease:\n  tag: \"{{component}}-v{{version}}\"\n", "unknown placeholder"},
+	}
+	for _, tc := range tests {
+		dir := t.TempDir()
+		err := loadErr(t, dir, tc.yaml)
+		if err == nil {
+			t.Errorf("%s: was accepted, want an error", tc.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want it to mention %q", tc.name, err, tc.want)
+		}
+	}
+}
+
+// A config error has to say which line to look at.
+func TestErrorsCarryTheLineNumber(t *testing.T) {
+	dir := t.TempDir()
+	err := loadErr(t, dir, "project: x\nversion: VERSION\nrelease:\n  brunch: main\n")
+	if err == nil || !strings.Contains(err.Error(), ":4:") {
+		t.Errorf("err = %v, want it to point at line 4", err)
+	}
+}
+
+// The superseded source/mirrors shape still loads, so an existing config keeps
+// working, and says so through Legacy.
+func TestLegacyShapeStillLoads(t *testing.T) {
+	dir := t.TempDir()
+	cfg := load(t, dir, `
 project:
   name: hop
 
@@ -103,93 +315,30 @@ version:
       field: version
 
 release:
-  branch: release
-  remote: upstream
-  tag: "{{ version }}"
-  commit: "chore: release {{ version }}"
-  push: false
+  branch: main
+  tag: "v{{ version }}"
 `)
-
-	cfg, err := Load(dir)
-	if err != nil {
-		t.Fatal(err)
+	if !cfg.Legacy {
+		t.Error("Legacy should be set for the source/mirrors shape")
 	}
-	if !cfg.FromFile {
-		t.Error("FromFile should be true")
+	if cfg.ProjectName != "hop" {
+		t.Errorf("ProjectName = %q, the nested project.name was not read", cfg.ProjectName)
 	}
-	if cfg.ProjectName != "hop" || cfg.Branch != "release" || cfg.Remote != "upstream" {
-		t.Errorf("got name=%q branch=%q remote=%q", cfg.ProjectName, cfg.Branch, cfg.Remote)
+	comp := cfg.Only()
+	if comp.Source().Path() != "VERSION" || len(comp.Mirrors()) != 1 {
+		t.Errorf("sources = %v", comp.Paths())
 	}
-	if cfg.Push {
-		t.Error("push: false was ignored")
-	}
-	// uprox tags without a v prefix — the template has to allow that.
-	if got := cfg.RenderTag("0.5.0"); got != "0.5.0" {
-		t.Errorf("RenderTag = %q, want 0.5.0", got)
-	}
-	if got := cfg.RenderCommit("0.5.0", "0.5.0"); got != "chore: release 0.5.0" {
-		t.Errorf("RenderCommit = %q", got)
-	}
-	if len(cfg.Mirrors) != 1 || cfg.Mirrors[0].Path() != "package.json" {
-		t.Fatalf("mirrors = %v", cfg.Paths())
-	}
-	if want := []string{"VERSION", "package.json"}; strings.Join(cfg.Paths(), ",") != strings.Join(want, ",") {
-		t.Errorf("Paths() = %v, want %v", cfg.Paths(), want)
-	}
-}
-
-// A config that only configures the release side still gets its version
-// location detected.
-func TestLoadPartialConfigDetectsSource(t *testing.T) {
-	dir := t.TempDir()
-	write(t, dir, "VERSION", "0.4.0\n")
-	write(t, dir, FileName, "release:\n  branch: trunk\n")
-
-	cfg, err := Load(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Branch != "trunk" {
-		t.Errorf("branch = %q", cfg.Branch)
-	}
-	if cfg.Source.Path() != "VERSION" {
-		t.Errorf("source = %q", cfg.Source.Path())
-	}
-}
-
-func TestLoadRejects(t *testing.T) {
-	cases := map[string]string{
-		"unknown key":            "releese:\n  branch: main\n",
-		"typo in placeholder":    "release:\n  tag: \"v{{ vesion }}\"\n",
-		"placeholder-free tag":   "release:\n  tag: \"v1.0.0\"\n",
-		"unterminated template":  "release:\n  tag: \"v{{ version\"\n",
-		"unknown source type":    "version:\n  source:\n    type: toml\n    path: Cargo.toml\n",
-		"source without type":    "version:\n  source:\n    path: VERSION\n",
-		"mirror duplicates path": "version:\n  source:\n    type: file\n    path: VERSION\n  mirrors:\n    - type: file\n      path: VERSION\n",
-	}
-	for name, yaml := range cases {
-		dir := t.TempDir()
-		write(t, dir, "VERSION", "0.4.0\n")
-		write(t, dir, FileName, yaml)
-		if _, err := Load(dir); err == nil {
-			t.Errorf("%s: expected an error", name)
-		}
+	if got := comp.Mirrors()[0].Describe(); got != "package.json#version" {
+		t.Errorf("mirror = %q", got)
 	}
 }
 
 func TestExpandTolerantOfWhitespace(t *testing.T) {
-	dir := t.TempDir()
-	write(t, dir, "VERSION", "0.4.0\n")
-	write(t, dir, FileName, "release:\n  tag: \"v{{version}}\"\n  commit: \"release: {{ tag }}\"\n")
-
-	cfg, err := Load(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.RenderTag("1.0.0"); got != "v1.0.0" {
+	comp := &Component{TagTemplate: "v{{ version }}", CommitTemplate: "release: {{tag}} / {{ version }}"}
+	if got := comp.RenderTag("1.0.0"); got != "v1.0.0" {
 		t.Errorf("RenderTag = %q", got)
 	}
-	if got := cfg.RenderCommit("1.0.0", "v1.0.0"); got != "release: v1.0.0" {
+	if got := comp.RenderCommit("1.0.0", "v1.0.0"); got != "release: v1.0.0 / 1.0.0" {
 		t.Errorf("RenderCommit = %q", got)
 	}
 }

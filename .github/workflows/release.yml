@@ -3,14 +3,14 @@ permissions:
   contents: write
 
 # Two release runs uploading assets to the same tag would race; queue them
-# instead (never cancel — a half-cancelled release could leave a tag with
+# instead (never cancel, because a half-cancelled release could leave a tag with
 # partial assets).
 concurrency:
   group: release
   cancel-in-progress: false
 
 # Tag pushes only. The version is decided by `stamp release` before the tag
-# exists, so there is nothing for a manual run to resolve — this pipeline is
+# exists, so there is nothing for a manual run to resolve. This pipeline is
 # deliberately a worker, not a controller.
 on:
   push:
@@ -93,7 +93,7 @@ jobs:
         run: go test ./...
 
   # Every target is a static CGO_ENABLED=0 build, so all six cross-compile from
-  # one Linux runner — no per-OS build matrix, and no runner-to-runner drift in
+  # one Linux runner: no per-OS build matrix, and no runner-to-runner drift in
   # the archives.
   build:
     needs: [verify, test]
@@ -116,7 +116,7 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build static binaries (windows, linux, darwin — amd64 + arm64)
+      - name: Build static binaries (windows, linux, darwin, amd64 + arm64)
         shell: bash
         env:
           VERSION: ${{ needs.verify.outputs.VERSION }}
@@ -167,7 +167,7 @@ jobs:
           retention-days: 7
 
   # Changelog generation (orhun/git-cliff-action) is a Docker action, which only
-  # runs on Linux — so publishing happens on ubuntu after downloading the
+  # runs on Linux, so publishing happens on ubuntu after downloading the
   # archives the build job produced.
   release:
     needs: [verify, build]

@@ -14,7 +14,7 @@ concurrency:
 jobs:
   test:
     # stamp shells out to git, and the integration tests drive real
-    # repositories — path handling, line endings and file permissions all
+    # repositories: path handling, line endings and file permissions all
     # behave differently per OS, so a single-OS run would not prove much.
     strategy:
       fail-fast: false

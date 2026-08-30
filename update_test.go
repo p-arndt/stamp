@@ -27,8 +27,8 @@ import (
 // mechanics: that stamp's configuration finds, verifies and installs a release
 // shaped the way .github/workflows/release.yml builds one.
 //
-// Three Config fields are the seams — APIBase points at a loopback server,
-// StatePath at a temp cache, ExecutablePath at a throwaway binary — so nothing
+// Three Config fields are the seams: APIBase points at a loopback server,
+// StatePath at a temp cache, ExecutablePath at a throwaway binary, so nothing
 // here touches the network or the real installation.
 
 // fakeRelease serves a complete GitHub release, metadata plus assets, and

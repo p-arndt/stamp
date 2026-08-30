@@ -4,21 +4,16 @@
 
 **Cut the release on your machine. Let CI do the boring half.**
 
-One command sets the version, writes it everywhere the project keeps it, checks that git is
-in a fit state, commits, tags, and pushes the branch and the tag together. Pushing the tag
-is what wakes up your pipeline — and by then the version is already decided, committed and
-immutable.
-
-*No version guessing in YAML. No half-finished releases. No four-step checklist in a
-RELEASE.md nobody reads.*
+One command sets the version, writes it everywhere the project keeps it, checks git,
+commits, tags, and pushes branch and tag together. The tag triggers your pipeline.
 
 [![CI](https://github.com/p-arndt/stamp/actions/workflows/ci.yml/badge.svg)](https://github.com/p-arndt/stamp/actions/workflows/ci.yml)
 [![Release](https://github.com/p-arndt/stamp/actions/workflows/release.yml/badge.svg)](https://github.com/p-arndt/stamp/actions/workflows/release.yml)
 [![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Platforms](https://img.shields.io/badge/platforms-windows%20%7C%20macOS%20%7C%20linux-informational)](#-install)
-[![Zero config](https://img.shields.io/badge/config-optional-success)](#%EF%B8%8F-configuration)
+[![Zero config](https://img.shields.io/badge/config-optional-success)](#configuration)
 
-[Supported](#-what-it-supports) · [Install](#-install) · [Commands](#-commands) · [How a release runs](#-how-a-release-runs) · [Checks](#-checks) · [Configuration](#%EF%B8%8F-configuration) · [CI](#-the-ci-side)
+[Supported](#what-it-supports) · [Install](#-install) · [Quickstart](#-quickstart) · [Commands](#-commands) · [Pre-releases](#pre-releases) · [How a release runs](#how-a-release-runs) · [Checks](#checks) · [Configuration](#configuration) · [Components](#-components) · [CI](#the-ci-side)
 
 </div>
 
@@ -28,65 +23,122 @@ RELEASE.md nobody reads.*
   <img src="./assets/demo.gif" alt="stamp release minor: the plan, the checks, one confirmation, then commit, tag and a single push" width="900">
 </p>
 
-<sub>`VERSION` is the source of truth here and `package.json` is a mirror, so both are bumped
-in one commit. Everything on screen is a real release of a throwaway repository built by
-[demo/setup.sh](demo/setup.sh) — re-record it yourself with `just demo`.</sub>
+<sub>Everything on screen is a real release of a throwaway repository. `VERSION` is the
+source of truth, `package.json` follows it, and both are bumped in one commit. Built by
+[demo/setup.sh](demo/setup.sh); re-record it with `just demo`.</sub>
 
-## 📦 What it supports
+## What it supports
 
 | | |
 | --- | --- |
-| **Version sources** | A plain text file (`VERSION`) · a JSON field (`package.json`, or any file and field) |
-| **Mirrors** | Any number of further locations, of either kind, bumped in the same commit |
+| **Version locations** | A plain text file (`VERSION`) · a field in JSON, YAML or TOML, nested fields included |
+| **Written as** | `VERSION` · `package.json#version` · `Chart.yaml#appVersion` · `pyproject.toml#project.version` |
+| **Several at once** | Any number of locations per component, all bumped in the same commit |
+| **Components** | Independently versioned units in one repository, each with its own files and its own tag |
 | **Version formats** | Strict semver, including pre-releases (`1.0.0-beta.1`) and build metadata |
 | **Bumps** | `patch` · `minor` · `major` · `final` · any explicit version |
-| **Pre-releases** | `stamp prerelease minor` opens a `beta` series and walks it: `-beta.1`, `-beta.2`, … |
-| **Tag styles** | `v0.5.0`, `0.5.0`, or whatever your template renders |
-| **Detected without config** | `VERSION` file · `package.json` |
-| **File formatting** | Preserved byte for byte apart from the version literal — tabs stay tabs, key order stays put, the diff is one line |
+| **Pre-releases** | `stamp prerelease minor` opens a `beta` series; a bare `stamp prerelease` walks it: `-beta.1`, `-beta.2`, … |
+| **Tag styles** | `v0.5.0`, `0.5.0`, `web-v0.5.0`, or whatever your template renders |
+| **Detected without config** | `VERSION` file · `package.json`. `stamp init` looks wider, see [Configuration](#configuration) |
+| **File formatting** | Preserved byte for byte apart from the version literal. Tabs stay tabs, key order stays put, comments survive, the diff is one line |
 | **Platforms** | Windows · macOS · Linux, amd64 and arm64, static binaries |
 | **Needs** | The `git` binary. Nothing else. |
-| **Not supported** | `Cargo.toml` / TOML sources · workspace fan-out (list the paths as mirrors) · running your tests |
+| **Not supported** | Version literals in arbitrary source files (no regex rewriting) · releasing every component at once · running your tests |
 
 ## 📥 Install
 
-Grab the archive for your platform from the [latest release](https://github.com/p-arndt/stamp/releases/latest) and put the binary on your `PATH`:
+macOS and Linux:
 
 ```bash
-# macOS (Apple silicon) — swap in darwin_amd64, linux_amd64 or linux_arm64 as needed
-curl -sSL https://github.com/p-arndt/stamp/releases/latest/download/stamp_<version>_darwin_arm64.tar.gz \
-  | tar -xz -C ~/.local/bin stamp
+curl -fsSL https://raw.githubusercontent.com/p-arndt/stamp/main/install.sh | sh
 ```
 
-Windows ships a `.zip` holding `stamp.exe`. Every archive is one static binary with no
-dependencies, and each release carries a `stamp_<version>_checksums.txt`.
+Windows, in PowerShell 5.1 or 7+:
 
-From source, with Go and [just](https://github.com/casey/just): `just install`.
+```powershell
+irm https://raw.githubusercontent.com/p-arndt/stamp/main/install.ps1 | iex
+```
+
+Detects your platform, verifies the archive's SHA-256 against the release's checksums file,
+installs only on a match. `wget -qO- … | sh` works too.
+
+Pin a version, or install somewhere else:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/p-arndt/stamp/main/install.sh \
+  | sh -s -- --version 0.2.0 --bin-dir ~/.local/bin
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/p-arndt/stamp/main/install.ps1))) -Version 0.2.0
+```
+
+| | Default | Environment variable |
+| --- | --- | --- |
+| Version | `latest` | `STAMP_VERSION` |
+| Directory | `~/.local/bin`, and `%LOCALAPPDATA%\Programs\stamp` on Windows | `STAMP_BIN_DIR` |
+| GitHub token | none, set one if your IP is rate-limited | `GITHUB_TOKEN` |
+
+Flags beat the environment; `install.sh --help` lists them. The shell script prints an
+`export PATH=…` line instead of editing your rc file; the PowerShell script writes the user
+`PATH` unless you pass `-NoAddToPath`.
+
+**By hand:** archive from the [latest release](https://github.com/p-arndt/stamp/releases/latest),
+checked against `stamp_<version>_checksums.txt`, binary onto your `PATH`.
+
+**From source,** with Go and [just](https://github.com/casey/just): `just install`.
 
 ### Staying current
 
-A release binary keeps itself up to date. `stamp self-update` downloads the archive for
-your platform, verifies its SHA-256 against the release's checksums file, and swaps the
-running binary only if that matches — an unverified download is never installed. Use
-`stamp check-update` to look without upgrading.
+`stamp self-update` swaps the running binary for the latest release, once the checksum
+verifies. `stamp check-update` looks without upgrading.
 
-Every command also prints a one-line hint on **stderr** when a newer version is known,
-at most one network check per day and cached in your config directory. It is stderr and
-never stdout, so `stamp current` stays safe in a shell substitution. Silence it with
-`STAMP_NO_UPDATE_CHECK=1`. Source builds report themselves as `dev` and never check or
-self-update — there is nothing to compare a `go build` against.
+A successful command hints on **stderr** when a newer version exists, at most once a day.
+`STAMP_NO_UPDATE_CHECK=1` silences it; source builds report as `dev` and never check.
+
+## 🚀 Quickstart
+
+With a `VERSION` file or a `package.json` there is nothing to set up:
+
+```console
+$ stamp current                   # what is committed right now
+0.4.0
+
+$ stamp release minor --dry-run   # the plan and every check, nothing written
+$ stamp release minor             # the real thing, after one confirmation
+```
+
+That writes `0.5.0` everywhere, commits, tags `v0.5.0`, pushes both. You supply the CI job
+that reacts to the tag.
+
+`stamp init` writes a `.stamp.yml` to edit if a default is wrong. A monorepo with separately
+versioned packages is what [Components](#-components) is for.
 
 ## 📟 Commands
 
 | Command | What it does |
 | --- | --- |
-| `stamp release <patch\|minor\|major\|final\|x.y.z>` | The whole release: resolve, check, write, commit, tag, push. `final` promotes a pre-release to the release it was for, dropping the pre-release and bumping nothing. |
-| `stamp prerelease [patch\|minor\|major]` | The same, cut as a pre-release: `1.2.3` → `1.3.0-beta.1`. Bare, it cuts the next candidate of the series already running. |
-| `stamp set <patch\|minor\|major\|final\|x.y.z>` | Write the version files only, no git. May also go backwards — it is the correction command. |
-| `stamp current` | Print the current version bare on stdout, for scripts and justfiles. |
-| `stamp verify --tag <tag>` | CI-side: does this tag match the committed version? Non-zero if not. |
+| `stamp init` | Ask a few questions, then write a `.stamp.yml` describing this repository. Optional; stamp works without one. |
+| `stamp release [component] <patch\|minor\|major\|final\|x.y.z>` | The whole release: resolve, check, write, commit, tag, push. `final` promotes a pre-release to the release it was for, dropping the pre-release and bumping nothing. |
+| `stamp prerelease [component] [patch\|minor\|major]` | The same, cut as a pre-release: `1.2.3` → `1.3.0-beta.1`. Bare, it cuts the next candidate of the series already running. Abbreviates to `stamp pre`. |
+| `stamp set [component] <patch\|minor\|major\|final\|x.y.z>` | Write the version files only, no git. May also go backwards. It is the correction command. |
+| `stamp current [component]` | Print the current version bare on stdout, for scripts and justfiles. |
+| `stamp verify [component] --tag <tag>` | CI-side: does this tag match the committed version? Non-zero if not. Without a component it works one out from the tag, and the tag may also be given bare: `stamp verify v0.5.0`. |
+| `stamp migrate` | Rewrite an older `.stamp.yml` in the current shape. `--dry-run` prints it instead. |
 | `stamp check-update` | Report whether a newer stamp has been released. |
 | `stamp self-update` | Replace this binary with the latest release, once its checksum verifies. |
+| `stamp version` | Print stamp's own version, commit and build date. |
+
+The component is named only in a repository whose `.stamp.yml` declares one, see
+[Components](#-components).
+
+| Flag for `init` | Effect |
+| --- | --- |
+| `--dry-run` | Print the file instead of writing it. |
+| `--force` | Overwrite an existing `.stamp.yml`. |
+| `-y`, `--yes` | Take every default instead of asking. |
+| `--file <loc>` | A version location, repeatable, in `path#field` form. Replaces detection entirely. |
+| `--name`, `--branch`, `--remote`, `--tag`, `--commit`, `--prerelease` | Override the corresponding config value instead of taking the detected one. |
 
 | Flag for `release` and `prerelease` | Effect |
 | --- | --- |
@@ -94,44 +146,32 @@ self-update — there is nothing to compare a `go build` against.
 | `--no-push` | Write, commit and tag locally; print the push command for later. |
 | `--no-fetch` | Skip the network checks. Useful offline; the remote state is then unverified. |
 | `--branch <name>` | Release from this branch instead of the configured one. |
-| `-y`, `--yes` | Skip the confirmation prompt. Required in a non-interactive shell — stamp never releases on an unanswered prompt. |
-| `--type <id>` | `prerelease` only: the identifier of the series — `beta`, `rc`, `alpha`, anything semver accepts. |
+| `-y`, `--yes` | Skip the confirmation prompt. Required in a non-interactive shell, because stamp never releases on an unanswered prompt. |
+| `--type <id>` | `prerelease` only: the identifier of the series: `beta`, `rc`, `alpha`, anything semver accepts. |
 
 Flags may come before or after the version: `stamp release minor --dry-run` works.
 
-### Pre-releases
+## Pre-releases
 
-`stamp prerelease` takes the same bump keyword as `release`, but reads it as *the smallest
-escalation the coming stable release stands for*. As long as that target version has not
-been reached, repeating the command only walks the counter — the base stays put, because a
-version that was never released has nothing to bump past:
+`stamp prerelease` has two forms:
 
 ```
-$ stamp prerelease minor      1.2.3        → 1.3.0-beta.1
-$ stamp prerelease            1.3.0-beta.1 → 1.3.0-beta.2   # same target, next candidate
+$ stamp prerelease minor      1.2.3        → 1.3.0-beta.1   # a bump opens a series
+$ stamp prerelease            1.3.0-beta.1 → 1.3.0-beta.2   # bare walks it
 $ stamp prerelease --type rc  1.3.0-beta.2 → 1.3.0-rc.1     # new series, counter restarts
-$ stamp prerelease major      1.3.0-rc.1   → 2.0.0-beta.1   # larger bump, new base
+$ stamp prerelease            1.3.0-rc.1   → 1.3.0-rc.2
 $ stamp release final         1.3.0-rc.1   → 1.3.0          # promoted, pre-release dropped
 ```
 
-The bump says which release the series is being cut *for*, so it is only needed to open a
-series or to move it to a higher one — inside a running series all three keywords resolve
-to the same next candidate, and a bare `stamp prerelease` says so. Off a stable version it
-is required: nothing else tells stamp whether `1.2.3` is heading for `1.2.4` or `2.0.0`. Every step is a normal release — commit, annotated tag, one push — and the
-tag carries the pre-release (`v1.3.0-beta.1`), so a pipeline can tell a candidate from a
-release by the tag alone.
+**A bump always bumps.** The pre-release is stripped and the keyword applied to what is
+left, so `minor` on `1.3.0-beta.1` and on `1.3.1-beta.1` both give `1.4.0-beta.1`. Same
+numbers as `npm version preminor` and `uv version --bump minor --bump beta`.
 
-Without `--type` stamp stays in the series the current version is already in, so walking an
-`rc` series does not need the flag repeated. Only a *new* series takes its identifier from
-`release.prerelease` in `.stamp.yml`, and from `beta` when that is unset. Going backwards
-inside a series (`rc.1` → `beta.1`) is lower in semver and fails the preflight like any
-other downgrade.
+**The bare form walks the running series** and inherits its identifier, so use it in scripts.
+Off a stable version it errors. A bump starts a new series at `release.prerelease`, default
+`beta`. Every step is a normal release, tagged `v1.3.0-beta.1`.
 
-There is deliberately **no `--no-commit`**: a tag without its version commit makes the
-repository state ambiguous, and the whole point is that the tag and the committed version
-always agree.
-
-## 🧭 How a release runs
+## How a release runs
 
 ```mermaid
 flowchart LR
@@ -156,51 +196,48 @@ flowchart LR
     class KEEP warn
 ```
 
-**Everything checkable happens before anything is written**, so the ordinary failure leaves
-nothing to undo. Every later failure has a defined resting place:
+Everything checkable runs before anything is written. Later failures each have a defined
+resting place:
 
 | Failed at | What stamp does |
 | --- | --- |
 | Writing a file | Restores every file it had already written. No commit, no tag, nothing pushed. |
 | Committing | Unstages, then restores the files. Same clean end state. |
-| Creating the tag | Keeps the commit — it is valid on its own — and prints the tag and push commands to continue with. |
+| Creating the tag | Keeps the commit, which is valid on its own, and prints the tag and push commands to continue with. |
 | Pushing | Rolls nothing back. Commit and tag are valid locally; prints the retry command, and the undo command if you would rather. |
 
-There is no `git reset --hard` anywhere in stamp. If a push half-succeeded, throwing away
-local history is the last thing you want.
+stamp never runs `git reset --hard` itself. After a failed push it prints one as the undo,
+next to the retry, and lets you pick.
 
-## ✅ Checks
+## Checks
 
 | Check | Why it exists |
 | --- | --- |
-| Version goes forwards | A release that lowers the version breaks every consumer's update logic. Equal is allowed — then stamp writes nothing and tags HEAD, which is the first-release case. |
-| Mirrors agree with the source | A drifted mirror means someone bumped one place by hand. Overwriting it would hide that. |
+| The repository has a commit | There is no HEAD to tag in an empty repository. This one fails alone: the checks below it need a commit to be about. |
+| Version goes forwards | A release that lowers the version breaks every consumer's update logic. Equal is allowed: stamp then writes nothing and tags HEAD, which is the first-release case. |
+| The other locations agree with the first | Either with the current version or with the one being released. Anything else means someone bumped one place by hand, and overwriting it would hide that. |
 | On the release branch | Default `main`. A release cut from a feature branch tags a commit that will be rewritten. |
 | Working tree clean | Untracked files included, so "clean" means what `git status` means. The release commit must hold only the version bump. |
-| Not behind the remote | Otherwise the tag names an already-outdated commit. Needs a `git fetch`; skip it with `--no-fetch`. |
+| Not behind the remote | Otherwise the tag names an already-outdated commit. Needs a `git fetch`, and a remote it cannot reach fails the check rather than being waved through; skip both with `--no-fetch`. |
 | Tag does not exist | Locally and on the remote. Reusing a tag silently changes what a published version means. |
 
-Two situations are reported with a `-` rather than failing: a branch with no upstream yet
-(the first push creates it), and the remote checks under `--no-fetch`.
+Reported with `-` rather than failing: a branch with no upstream, and the up-to-date check
+under `--no-fetch`, which also drops the remote half of the tag check.
 
-**Tests are not stamp's job.** There is no `checks:` block and no `--check` flag — your
-pipeline already tests before it publishes, and a release tool that shells out to your test
-suite is a release tool that takes eight minutes and fails for reasons unrelated to
-releasing.
+**Tests are not stamp's job.** There is no `checks:` block and no `--check` flag.
 
-A failed preflight lists every problem at once, with the fix in the same line, so you fix
-them in one go rather than one release attempt at a time:
+A failed preflight lists every problem at once, with the fix in the same line:
 
 ```console
 $ stamp release minor
 
 Checks:
   ✓ 0.6.0 is newer than 0.5.0
-  ✗ on branch main — HEAD is on feature — check out main, set release.branch in .stamp.yml, or pass --branch feature
-  ✗ working tree clean — 1 uncommitted change(s) — the release commit must hold only the version bump
-  - branch up to date with the remote — feature has no upstream yet — the push will create it
+  ✗ on branch main: HEAD is on feature, check out main, set release.branch in .stamp.yml, or pass --branch feature
+  ✗ working tree clean: 1 uncommitted change(s); the release commit must hold only the version bump
+  - branch up to date with the remote: feature has no upstream yet, the push will create it
 
-error: preflight failed — nothing was changed
+error: preflight failed, nothing was changed
 ```
 
 And an abort says what it undid, and what never happened:
@@ -220,13 +257,13 @@ No tag created.
 Nothing pushed.
 ```
 
-## ⚙️ Configuration
+## Configuration
 
-Optional. Without a `.stamp.yml`:
+stamp runs without a config. `.stamp.yml` is for when a default is wrong:
 
 | | Default |
 | --- | --- |
-| Version source | `VERSION` if present, otherwise `package.json`'s `version` field |
+| Version location | `VERSION` if present, otherwise `package.json`'s `version` field |
 | Branch | `main` |
 | Remote | `origin` |
 | Tag | `v{{ version }}` |
@@ -234,21 +271,81 @@ Optional. Without a `.stamp.yml`:
 | Push | yes |
 | Pre-release identifier | `beta` |
 
-Everything your project does differently goes in `.stamp.yml` in the repository root:
+`stamp init` writes one for you, every default spelled out so you can edit it:
+
+```console
+$ stamp init
+
+stamp init
+
+Found these version files:
+  VERSION
+  package.json#version
+
+Project name? [stamp]
+Release from which branch? [main]
+Push to which remote? [origin]
+Tag template? [v{{version}}]
+
+This is what stamp will write to .stamp.yml:
+  …
+
+Write it? [Y/n]
+
+Wrote .stamp.yml
+
+Project       stamp
+Version       0.4.0 (VERSION)
+Mirror        package.json#version
+Tag           v0.4.0
+Branch        main
+Remote        origin
+```
+
+`stamp init --yes` skips the questions and takes every default; `--dry-run` prints
+the file instead of writing it.
+
+### Where the version lives
 
 ```yaml
-project:
-  name: hop                     # shown in the output; defaults to the directory name
+version:
+  - VERSION                          # the first file is the source of truth
+  - package.json#version             # every other one is written to match it
+  - charts/app/Chart.yaml#appVersion
+  - pyproject.toml#project.version
+```
+
+A bare path is a text file holding nothing but the version. `path#field` addresses a
+field inside a document, and the format follows the extension:
+
+| Extension | Kind | Example |
+| --- | --- | --- |
+| *(none, or anything else)* | Plain text file | `VERSION`, `version.txt` |
+| `.json` | JSON field | `package.json#version`, `manifest.json#app.version` |
+| `.yaml`, `.yml` | YAML field | `charts/app/Chart.yaml#appVersion` |
+| `.toml` | TOML key | `pyproject.toml#project.version`, `Cargo.toml#package.version` |
+
+Fields are dot-separated, so nested values work, and the field defaults to `version`. Where
+the extension lies about the format, write it out:
+
+```yaml
+version:
+  - path: version.conf
+    type: yaml
+    field: app.version
+```
+
+Files are edited in place, never re-marshalled, so comments, key order, indentation and
+quoting survive, so the diff is one line per file.
+
+### The whole file
+
+```yaml
+project: hop                    # shown in the output; defaults to the directory name
 
 version:
-  source:
-    type: file                  # file | json
-    path: VERSION
-
-  mirrors:                      # kept in sync with the source, all in one commit
-    - type: json
-      path: package.json
-      field: version            # optional, defaults to "version"
+  - VERSION
+  - package.json#version
 
 release:
   branch: main
@@ -262,29 +359,88 @@ release:
 A Node project, where `package.json` *is* the source of truth:
 
 ```yaml
-version:
-  source:
-    type: json
-    path: package.json
+version: package.json#version
 ```
 
-Templates take `{{ version }}` in the tag, and `{{ version }}` or `{{ tag }}` in the commit
-message; inner spaces are optional. A placeholder typo, a template with no placeholder at
-all, or an unknown key anywhere in the file is a config error — not a tag literally named
-`v{{ vesion }}`.
+`tag` takes `{{ version }}`, `commit` also `{{ tag }}`, both `{{ component }}` where
+components are declared. A typo, a tag without `{{ version }}`, or an unknown key is a
+config error.
 
-## 🤖 The CI side
+### Coming from an older config
+
+`version.source` and `version.mirrors` still load, with a notice on stderr. `stamp migrate`
+rewrites the file in the list form:
+
+```yaml
+# before                          # after
+version:                          version:
+  source:                           - VERSION
+    type: file                      - package.json#version
+    path: VERSION
+  mirrors:
+    - type: json
+      path: package.json
+      field: version
+```
+
+## 🧩 Components
+
+A `components:` block gives each independently released unit of a monorepo its own
+version, its own files and its own tag. `stamp release <name>` touches only that one:
+
+```yaml
+project: mono
+
+release:                              # applies to every component
+  branch: main
+  remote: origin
+  commit: "release: {{ tag }}"
+  prerelease: beta
+  tag: "{{ component }}-v{{ version }}"
+
+components:
+  cli:
+    version:
+      - VERSION
+      - package.json#version
+    tag: v{{ version }}               # overrides just this key
+  web:
+    version: web/package.json#version # inherits everything, tagged web-v1.2.0
+```
+
+```console
+$ stamp release web minor
+$ stamp current web
+$ stamp verify --tag web-v1.2.0
+```
+
+A component inherits every key under `release:` and overrides only the ones it names, key
+by key. Without a component name stamp refuses to guess:
+
+```console
+$ stamp release minor
+
+error: this repository has components (cli, web): name one, e.g. `stamp release cli minor`
+```
+
+`stamp verify` is the exception: it works the component out from the tag, which is all a
+CI job knows.
+
+Caught at load: one file listed by two components, and two components rendering the same
+tag. A repository versioning a single thing writes no `components:` block at all.
+
+## The CI side
 
 ```mermaid
 flowchart LR
-    subgraph LOCAL["stamp — the controller"]
+    subgraph LOCAL["stamp: the controller"]
         direction TB
         V["set the version"] --> C["check"] --> K["commit"] --> T["tag"] --> P["push"]
     end
 
     HANDOFF{{"tag v0.5.0"}}
 
-    subgraph REMOTE["GitHub Action — the worker"]
+    subgraph REMOTE["GitHub Action: the worker"]
         direction TB
         VER["validate the tag"] --> TEST["test"] --> X["cross-compile"] --> A["archives + checksums"] --> REL["changelog + release"]
     end
@@ -301,8 +457,8 @@ flowchart LR
     style REMOTE fill:#fdfaff,stroke:#e9d5ff,color:#334155
 ```
 
-The pipeline never decides a version. Its first job is to confirm that the tag agrees with
-the version committed in the repository:
+The pipeline never decides a version. Its first job is to confirm the tag agrees with the
+committed version:
 
 ```yaml
 on:
@@ -314,13 +470,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: curl -sSL https://github.com/p-arndt/stamp/releases/latest/download/stamp_0.1.0_linux_amd64.tar.gz | tar -xz -C /usr/local/bin stamp
+      - run: curl -fsSL https://raw.githubusercontent.com/p-arndt/stamp/main/install.sh | sh -s -- --bin-dir /usr/local/bin
       - run: stamp verify --tag "$GITHUB_REF_NAME"
 ```
 
-`verify` compares *forwards* — version → tag — instead of stripping a prefix off the tag:
-reversing a template is ambiguous, rendering one is not. It checks every mirror too, so the
-published artifacts can never disagree about their own version.
-
-This repository's own [release.yml](.github/workflows/release.yml) is a working example — it
-verifies with `go run . verify`, so stamp checks its own tag on the way out.
+`verify` compares *forwards*: it renders the tag from the committed version rather than
+stripping a prefix off the tag, checks every version location, and identifies the component
+the same way. [release.yml](.github/workflows/release.yml) is a working example.
