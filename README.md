@@ -125,6 +125,7 @@ versioned packages is what [Components](#-components) is for.
 | `stamp set [component] <patch\|minor\|major\|final\|x.y.z>` | Write the version files only, no git. May also go backwards. It is the correction command. |
 | `stamp note [component] <added\|changed\|deprecated\|removed\|fixed\|security> <text>` | Record one user-facing change as a file under `.stamp/changelog`, to be committed with the branch that made it. The next release renders it into the changelog. |
 | `stamp changelog [component]` | Print the entries noted since the last release, rendered as the section a release would write. |
+| `stamp retag [component]` | Move this version's tag onto HEAD, keeping its message. For the release whose pipeline failed and published nothing. `--dry-run`, `--no-push`, `-y`. |
 | `stamp current [component]` | Print the current version bare on stdout, for scripts and justfiles. |
 | `stamp verify [component] --tag <tag>` | CI-side: does this tag match the committed version? Non-zero if not. Without a component it works one out from the tag, and the tag may also be given bare: `stamp verify v0.5.0`. |
 | `stamp migrate` | Rewrite an older `.stamp.yml` in the current shape. `--dry-run` prints it instead. |
@@ -237,6 +238,31 @@ resting place:
 
 stamp never runs `git reset --hard` itself. After a failed push it prints one as the undo,
 next to the retry, and lets you pick.
+
+**When the pipeline is what failed,** the tag is already out and nothing was published. Fix
+the commit, push it, then `stamp retag` deletes the tag on both sides and recreates it on
+HEAD with the same message, so the release notes rendered into it survive: the fragments
+they came from were deleted by the release that failed.
+
+```console
+$ stamp retag
+
+Retag stamp
+Version       0.3.0
+Tag           v0.3.0
+Moving        21df1cf → 8ac0e11 (HEAD)
+Notes         4 entries carried over from the old tag
+
+Checks:
+  ✓ v0.3.0 points at 21df1cf, not at HEAD
+  ✓ on branch main
+  ✓ working tree clean
+  ✓ HEAD is on origin
+```
+
+Whether anything was published under that tag is the one thing stamp cannot check, because
+it speaks git and not GitHub. The confirmation says the rule and you answer it: a tag that
+has already shipped a release must never move.
 
 ## Checks
 

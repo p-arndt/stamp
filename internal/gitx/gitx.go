@@ -176,6 +176,38 @@ func (r *Repo) DeleteTag(tag string) error {
 	return err
 }
 
+// DeleteRemoteTag removes a tag from remote.
+//
+// It streams, like Push, because deleting a ref is a network operation whose
+// progress and refusals the user has to see as they happen.
+func (r *Repo) DeleteRemoteTag(remote, tag string) error {
+	return r.stream("push", "--delete", remote, "refs/tags/"+tag)
+}
+
+// PushTag sends tag to remote on its own.
+//
+// Push sends a branch and a tag together, so a tag can never arrive without
+// its commit. This one sends the tag alone, which is only safe once the commit
+// it points at is already on the remote: every caller has to have established
+// that first.
+func (r *Repo) PushTag(remote, tag string) error {
+	return r.stream("push", remote, "refs/tags/"+tag)
+}
+
+// TagMessage returns the full message of an annotated tag, subject and body,
+// as Tag wrote it. A lightweight tag has none and returns "".
+func (r *Repo) TagMessage(tag string) (string, error) {
+	return r.git("tag", "-l", "--format=%(contents)", tag)
+}
+
+// TagCommit returns the abbreviated hash of the commit tag points at.
+//
+// The ^{commit} suffix dereferences an annotated tag, whose own object is the
+// tag rather than the commit, so the answer is comparable with ShortHEAD.
+func (r *Repo) TagCommit(tag string) (string, error) {
+	return r.git("rev-parse", "--short", tag+"^{commit}")
+}
+
 // Push sends branch and tag to remote in a single invocation, so the tag can
 // never arrive without the commit it points at.
 func (r *Repo) Push(remote, branch, tag string) error {

@@ -166,6 +166,107 @@ func requireContains(t *testing.T, out string, want ...string) {
 }
 
 // ---------------------------------------------------------------------------
+// retag
+// ---------------------------------------------------------------------------
+
+// The point of the command: a release whose pipeline failed is re-cut on the
+// fixed commit, and the release notes, whose fragments the first release
+// already deleted, come along in the tag message.
+func TestRetagMovesTheTagAndKeepsTheNotes(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.mustStamp("note", "added", "Something a user can see")
+	r.commitAll("feat: something")
+	r.push()
+	r.mustStamp("release", "minor", "-y")
+
+	before := r.git("rev-parse", "--short", "v0.5.0^{commit}")
+	body := r.git("tag", "-l", "--format=%(contents:body)", "v0.5.0")
+	requireContains(t, body, "### Added", "Something a user can see")
+
+	// The fix the failed pipeline needed.
+	r.git("commit", "-q", "--allow-empty", "-m", "fix: the pipeline problem")
+	r.push()
+	head := r.git("rev-parse", "--short", "HEAD")
+
+	out := r.mustStamp("retag", "-y")
+	requireContains(t, out, "1 entry carried over", before+" \u2192 "+head)
+
+	if got := r.git("rev-parse", "--short", "v0.5.0^{commit}"); got != head {
+		t.Errorf("tag points at %s, want HEAD %s", got, head)
+	}
+	if got := r.git("tag", "-l", "--format=%(contents:body)", "v0.5.0"); got != body {
+		t.Errorf("tag body = %q, want the old one %q", got, body)
+	}
+	// And the remote agrees, which is the half that matters to the pipeline.
+	if got := r.remoteGit("rev-parse", "--short", "v0.5.0^{commit}"); got != head {
+		t.Errorf("remote tag points at %s, want %s", got, head)
+	}
+}
+
+// Moving a tag onto the commit it already points at would delete a remote ref
+// for nothing, so it is refused rather than quietly done.
+func TestRetagRefusesWhenTheTagIsAlreadyOnHead(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.mustStamp("release", "minor", "-y")
+
+	out, code := r.stamp("retag", "-y")
+	if code == 0 {
+		t.Fatalf("retag succeeded with nothing to move:\n%s", out)
+	}
+	requireContains(t, out, "nothing to move", "preflight failed, nothing was changed")
+}
+
+// The tag is pushed on its own, so the commit it names has to be on the remote
+// already. Otherwise the remote would hold a tag for a commit it does not have.
+func TestRetagRefusesWhenHeadIsNotPushed(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.mustStamp("release", "minor", "-y")
+	r.git("commit", "-q", "--allow-empty", "-m", "fix: not pushed yet")
+
+	out, code := r.stamp("retag", "-y")
+	if code == 0 {
+		t.Fatalf("retag succeeded with an unpushed HEAD:\n%s", out)
+	}
+	requireContains(t, out, "not pushed", "the remote does not have")
+	// The remote tag is untouched: a failed preflight changes nothing.
+	if got := r.remoteGit("tag", "-l", "v0.5.0"); got != "v0.5.0" {
+		t.Errorf("remote tag = %q, want it left in place", got)
+	}
+}
+
+// --no-push moves the local tag only, for a repository whose remote is not
+// reachable at that moment.
+func TestRetagLocalOnly(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+	r.mustStamp("release", "minor", "-y")
+	before := r.remoteGit("rev-parse", "--short", "v0.5.0^{commit}")
+	r.git("commit", "-q", "--allow-empty", "-m", "fix: the pipeline problem")
+
+	out := r.mustStamp("retag", "--no-push", "-y")
+	requireContains(t, out, "Not pushing (--no-push).", "git push --delete origin v0.5.0")
+	if got := r.remoteGit("rev-parse", "--short", "v0.5.0^{commit}"); got != before {
+		t.Errorf("remote tag moved to %s, want it left at %s", got, before)
+	}
+}
+
+// There has to be a tag to move: the command that creates one is `release`,
+// and the error says so.
+func TestRetagWithoutATag(t *testing.T) {
+	r := newRepo(t)
+	r.seed("0.4.0")
+
+	out, code := r.stamp("retag", "-y")
+	if code == 0 {
+		t.Fatalf("retag succeeded without a tag:\n%s", out)
+	}
+	requireContains(t, out, "v0.4.0 does not exist locally", "stamp release 0.4.0")
+}
+
+// ---------------------------------------------------------------------------
 // release
 // ---------------------------------------------------------------------------
 

@@ -44,6 +44,7 @@ Usage:
                                               record one user-facing change for the changelog
   stamp changelog  [component]                print the entries noted since the last release
   stamp current    [component]                print the current version
+  stamp retag      [component]                move this version's tag onto HEAD, keeping its message
   stamp verify --tag <tag>                    check a tag against the committed version
   stamp check-update                          report whether a newer stamp is available
   stamp self-update                           replace this binary with the latest release
@@ -74,6 +75,11 @@ Flags for release and prerelease:
   --edit             open the rendered changelog section in $EDITOR first
   -y, --yes          skip the confirmation prompt
   --type <id>        prerelease only: the identifier, e.g. beta, rc, alpha
+
+Flags for retag:
+  --dry-run          show the plan and the checks, change nothing
+  --no-push          move the local tag only
+  -y, --yes          skip the confirmation prompt
 
 Where the version lives
 
@@ -232,6 +238,8 @@ func run(args []string) error {
 		return cmdChangelog(args[1:])
 	case "current":
 		return cmdCurrent(args[1:])
+	case "retag":
+		return cmdRetag(args[1:])
 	case "verify":
 		return cmdVerify(args[1:])
 	case "self-update":
@@ -976,6 +984,260 @@ func cmdCurrent(args []string) error {
 // It compares forwards. It renders the tag template from the committed version
 // and compares that to the given tag, rather than trying to strip a prefix off
 // the tag. Reversing a template is ambiguous; rendering it is not.
+// cmdRetag moves a release tag onto HEAD, keeping its message.
+//
+// It exists for one situation: the pipeline the tag triggered failed, nothing
+// was published, and the fix is a commit or two later. Cutting the same
+// version again is then the honest thing to do, and doing it by hand is three
+// commands with a delete among them.
+//
+// The message is carried over from the tag being replaced, which is what makes
+// this worth a command rather than a paragraph in the README: the release
+// notes live in that message, and the fragments they were rendered from are
+// gone, deleted by the release that produced the tag in the first place.
+//
+// What stamp cannot check is the only thing that really matters, namely
+// whether anything was published under this tag: that lives in the forge, and
+// stamp speaks git and nothing else. So the confirmation says the rule out
+// loud and the human answers it.
+func cmdRetag(args []string) error {
+	var (
+		dryRun bool
+		noPush bool
+		yes    bool
+	)
+	fs := flag.NewFlagSet("retag", flag.ContinueOnError)
+	fs.BoolVar(&dryRun, "dry-run", false, "show the plan and the checks, change nothing")
+	fs.BoolVar(&noPush, "no-push", false, "move the local tag only")
+	fs.BoolVar(&yes, "yes", false, "skip the confirmation prompt")
+	fs.BoolVar(&yes, "y", false, "skip the confirmation prompt")
+	if err := fs.Parse(splitFlags(args)); err != nil {
+		return err
+	}
+
+	cfg, repo, err := load()
+	if err != nil {
+		return err
+	}
+	comp, rest, err := selectComponent(cfg, fs.Args())
+	if err != nil {
+		return err
+	}
+	if len(rest) != 0 {
+		component := ""
+		if cfg.Multi {
+			component = "[component] "
+		}
+		return fmt.Errorf("usage: stamp retag %s[flags]", component)
+	}
+
+	current, err := comp.Source().Read()
+	if err != nil {
+		return err
+	}
+	tag := comp.RenderTag(current)
+
+	exists, err := repo.TagExists(tag)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("%s does not exist locally: there is nothing to move, and `stamp release %s` is the command that creates it", tag, current)
+	}
+	head, err := repo.ShortHEAD()
+	if err != nil {
+		return err
+	}
+	was, err := repo.TagCommit(tag)
+	if err != nil {
+		return err
+	}
+	message, err := repo.TagMessage(tag)
+	if err != nil {
+		return err
+	}
+	if message == "" {
+		// A lightweight tag, or one made by something other than stamp. The
+		// tag name is what `stamp release` would have written anyway.
+		message = tag
+	}
+
+	ui.Title("Retag %s", comp.Label())
+	if cfg.Multi {
+		ui.Field("Component", fmt.Sprintf("%s of %s", comp.Name, cfg.ProjectName))
+	}
+	ui.Field("Version", current)
+	ui.Field("Tag", tag)
+	ui.Field("Moving", fmt.Sprintf("%s → %s (HEAD)", was, head))
+	if noPush {
+		ui.Field("Remote", "(not pushing)")
+	} else {
+		ui.Field("Remote", comp.Remote)
+	}
+	if n := countEntries(changelog.Body(message)); n > 0 {
+		notes := fmt.Sprintf("%d entries", n)
+		if n == 1 {
+			notes = "1 entry"
+		}
+		ui.Field("Notes", notes+" carried over from the old tag")
+	}
+
+	ok, err := retagChecks(repo, comp, tag, was, head, noPush)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		ui.Blank()
+		ui.Errorf("preflight failed, nothing was changed")
+		return errQuiet
+	}
+	if dryRun {
+		ui.Blank()
+		ui.Note("Dry run. Nothing was changed.")
+		return nil
+	}
+
+	if !yes {
+		ui.Blank()
+		ui.Note("A tag that has already published a release must never move: everyone who")
+		ui.Note("installed it would silently get something else. This is for the release")
+		ui.Note("whose pipeline failed and published nothing.")
+		confirmed, err := ui.Confirm(fmt.Sprintf("Delete %s and recreate it on %s?", tag, head))
+		if err != nil {
+			return err
+		}
+		if !confirmed {
+			ui.Note("Aborted. Nothing was changed.")
+			return errQuiet
+		}
+	}
+
+	ui.Blank()
+	// The remote goes first. The local tag is the copy of the message and of
+	// the old commit, so it is what makes the operation recoverable, and it is
+	// given up last.
+	if !noPush {
+		if err := repo.DeleteRemoteTag(comp.Remote, tag); err != nil {
+			ui.Blank()
+			ui.Errorf("deleting %s on %s failed: %v", tag, comp.Remote, err)
+			ui.Hint("nothing was changed locally; the tag still points at %s", was)
+			return errQuiet
+		}
+		ui.Step("  deleted %s on %s", tag, comp.Remote)
+	}
+	if err := repo.DeleteTag(tag); err != nil {
+		return fmt.Errorf("deleting the local %s: %w", tag, err)
+	}
+	if err := repo.Tag(tag, message); err != nil {
+		ui.Blank()
+		ui.Errorf("recreating %s failed: %v", tag, err)
+		ui.Hint("the old tag is gone; recreate it with: git tag -a %s %s -m …", tag, was)
+		return errQuiet
+	}
+	ui.Step("  tagged %s on %s", tag, head)
+
+	if noPush {
+		ui.Blank()
+		ui.Note("Not pushing (--no-push).")
+		ui.Note("When ready: git push --delete %s %s && git push %s %s", comp.Remote, tag, comp.Remote, tag)
+		return nil
+	}
+	if err := repo.PushTag(comp.Remote, tag); err != nil {
+		ui.Blank()
+		ui.Errorf("push failed: %v", err)
+		ui.Hint("the tag exists locally on %s; retry with: git push %s %s", head, comp.Remote, tag)
+		return errQuiet
+	}
+	ui.Blank()
+	ui.Step("Done. %s now points at %s. The release workflow runs again.", tag, head)
+	return nil
+}
+
+// countEntries counts the list items in a rendered changelog body, so the
+// retag plan can say how much of the release notes it is carrying over. The
+// notes are the reason a tag is worth moving rather than recutting, so their
+// survival is worth showing.
+func countEntries(body string) int {
+	n := 0
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "- ") {
+			n++
+		}
+	}
+	return n
+}
+
+// retagChecks is the preflight of a retag. It is deliberately not the release
+// preflight: most of those checks are about a version that is about to change,
+// and here it is not. What is left is what makes moving a tag safe.
+func retagChecks(repo *gitx.Repo, comp *config.Component, tag, was, head string, noPush bool) (bool, error) {
+	ui.Section("Checks:")
+	passed := true
+	pass := func(label string) { ui.Pass(label) }
+	fail := func(label string) {
+		ui.Fail(label)
+		passed = false
+	}
+
+	// Moving a tag onto the commit it already points at is not a correction,
+	// it is a no-op that would delete a remote ref for nothing.
+	if was == head {
+		fail(fmt.Sprintf("%s points at an earlier commit: it is already on %s, so there is nothing to move", tag, head))
+	} else {
+		pass(fmt.Sprintf("%s points at %s, not at HEAD", tag, was))
+	}
+
+	branch, err := repo.CurrentBranch()
+	if err != nil {
+		return false, err
+	}
+	if branch == comp.Branch {
+		pass(fmt.Sprintf("on branch %s", comp.Branch))
+	} else {
+		fail(fmt.Sprintf("on branch %s: HEAD is on %s, and a tag on a branch that will be rewritten is worse than the one you are replacing", comp.Branch, branch))
+	}
+
+	clean, err := repo.IsClean()
+	if err != nil {
+		return false, err
+	}
+	if clean {
+		pass("working tree clean")
+	} else {
+		fail("working tree clean: commit or stash first, so the tag names what you think it names")
+	}
+
+	// The tag is pushed on its own, so the commit it points at has to be on
+	// the remote already. Otherwise the remote would hold a tag for a commit
+	// it does not have.
+	if noPush {
+		ui.Skip("HEAD is on the remote: not pushing")
+		return passed, nil
+	}
+	upstream, hasUpstream, err := repo.Upstream(branch)
+	if err != nil {
+		return false, err
+	}
+	if !hasUpstream {
+		fail(fmt.Sprintf("HEAD is on %s: %s has no upstream, so push the branch first", comp.Remote, branch))
+		return passed, nil
+	}
+	if err := repo.Fetch(comp.Remote); err != nil {
+		fail(fmt.Sprintf("HEAD is on %s: %v", comp.Remote, err))
+		return passed, nil
+	}
+	ahead, _, err := repo.Divergence(branch, upstream)
+	if err != nil {
+		return false, err
+	}
+	if ahead > 0 {
+		fail(fmt.Sprintf("HEAD is on %s: %d commit(s) not pushed; the tag would name a commit the remote does not have", comp.Remote, ahead))
+	} else {
+		pass(fmt.Sprintf("HEAD is on %s", comp.Remote))
+	}
+	return passed, nil
+}
+
 func cmdVerify(args []string) error {
 	var tag string
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
