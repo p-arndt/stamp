@@ -3,6 +3,7 @@ package source
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -305,7 +306,14 @@ func TestTOMLRefusesMultiLineString(t *testing.T) {
 
 // Writing must not change a file's permissions: a version file may be
 // executable or group-writable for reasons that are none of stamp's business.
+//
+// Unix only. Windows has no permission bits to preserve: chmod there toggles
+// the read-only flag and nothing else, so a file chmod-ed to 0600 still reads
+// back as 0666, and the invariant this test is about does not exist.
 func TestWriteKeepsFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no Unix permission bits on Windows")
+	}
 	dir := t.TempDir()
 	write(t, dir, "VERSION", "0.22.2\n")
 	path := filepath.Join(dir, "VERSION")
