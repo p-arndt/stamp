@@ -13,7 +13,7 @@ commits, tags, and pushes branch and tag together. The tag triggers your pipelin
 [![Platforms](https://img.shields.io/badge/platforms-windows%20%7C%20macOS%20%7C%20linux-informational)](#-install)
 [![Zero config](https://img.shields.io/badge/config-optional-success)](#configuration)
 
-[Supported](#what-it-supports) · [Install](#-install) · [Quickstart](#-quickstart) · [Commands](#-commands) · [Pre-releases](#pre-releases) · [Changelog](#-changelog) · [How a release runs](#how-a-release-runs) · [Checks](#checks) · [Configuration](#configuration) · [Components](#-components) · [CI](#the-ci-side)
+[Getting started](#-getting-started) · [Supported](#what-it-supports) · [Install](#-install) · [Commands](#-commands) · [Pre-releases](#pre-releases) · [Changelog](#-changelog) · [How a release runs](#how-a-release-runs) · [Checks](#checks) · [Configuration](#configuration) · [Components](#-components) · [CI](#the-ci-side)
 
 </div>
 
@@ -23,9 +23,49 @@ commits, tags, and pushes branch and tag together. The tag triggers your pipelin
   <img src="./assets/demo.gif" alt="stamp release minor: the plan, the checks, one confirmation, then commit, tag and a single push" width="900">
 </p>
 
-<sub>Everything on screen is a real release of a throwaway repository. `VERSION` is the
-source of truth, `package.json` follows it, and both are bumped in one commit. Built by
-[demo/setup.sh](demo/setup.sh); re-record it with `just demo`.</sub>
+<sub>A real release of a throwaway repository: `VERSION` is the source of truth,
+`package.json` follows it, both bumped in one commit. Built by [demo/setup.sh](demo/setup.sh).</sub>
+
+## 🚀 Getting started
+
+**1. Install it.** macOS and Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/p-arndt/stamp/main/install.sh | sh
+```
+
+Windows, in PowerShell 5.1 or 7+:
+
+```powershell
+irm https://raw.githubusercontent.com/p-arndt/stamp/main/install.ps1 | iex
+```
+
+**2. Look at the plan.** In a repository with a `VERSION` file or a `package.json` there is
+nothing to configure:
+
+```console
+$ stamp current                   # what is committed right now
+0.4.0
+
+$ stamp release minor --dry-run   # the plan and every check, nothing written
+```
+
+**3. Cut the release.**
+
+```console
+$ stamp release minor             # the real thing, after one confirmation
+```
+
+That writes `0.5.0` everywhere the version lives, commits it, tags `v0.5.0` and pushes
+branch and tag in one go. The tag is what your pipeline reacts to — see [the CI side](#the-ci-side).
+
+> [!TIP]
+> `--dry-run` is safe to run anywhere and prints exactly what the real command would do,
+> checks included. Reach for it first.
+
+> [!NOTE]
+> A default wrong for your repository? `stamp init` writes a `.stamp.yml` to edit. A monorepo
+> with separately versioned packages is what [Components](#-components) is for.
 
 ## What it supports
 
@@ -48,20 +88,9 @@ source of truth, `package.json` follows it, and both are bumped in one commit. B
 
 ## 📥 Install
 
-macOS and Linux:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/p-arndt/stamp/main/install.sh | sh
-```
-
-Windows, in PowerShell 5.1 or 7+:
-
-```powershell
-irm https://raw.githubusercontent.com/p-arndt/stamp/main/install.ps1 | iex
-```
-
-Detects your platform, verifies the archive's SHA-256 against the release's checksums file,
-installs only on a match. `wget -qO- … | sh` works too.
+The one-liners in [Getting started](#-getting-started) detect your platform, verify the
+archive's SHA-256 against the release's checksums file, and install only on a match.
+`wget -qO- … | sh` works too.
 
 Pin a version, or install somewhere else:
 
@@ -91,29 +120,12 @@ checked against `stamp_<version>_checksums.txt`, binary onto your `PATH`.
 
 ### Staying current
 
-`stamp self-update` swaps the running binary for the latest release, once the checksum
-verifies. `stamp check-update` looks without upgrading.
+> [!TIP]
+> `stamp self-update` swaps the running binary for the latest release, once the checksum
+> verifies. `stamp check-update` looks without upgrading.
 
 A successful command hints on **stderr** when a newer version exists, at most once a day.
 `STAMP_NO_UPDATE_CHECK=1` silences it; source builds report as `dev` and never check.
-
-## 🚀 Quickstart
-
-With a `VERSION` file or a `package.json` there is nothing to set up:
-
-```console
-$ stamp current                   # what is committed right now
-0.4.0
-
-$ stamp release minor --dry-run   # the plan and every check, nothing written
-$ stamp release minor             # the real thing, after one confirmation
-```
-
-That writes `0.5.0` everywhere, commits, tags `v0.5.0`, pushes both. You supply the CI job
-that reacts to the tag.
-
-`stamp init` writes a `.stamp.yml` to edit if a default is wrong. A monorepo with separately
-versioned packages is what [Components](#-components) is for.
 
 ## 📟 Commands
 
@@ -199,7 +211,10 @@ never conflict over the changelog.
 | **Handoff** | That section is the annotated tag's message, so the pipeline generates nothing: `git tag -l --format='%(contents:body)' "$TAG"` |
 | **`--edit`** | Opens the rendered section in `$EDITOR` before it is committed |
 | **Nothing noted** | Drafted from the conventional commits since the last tag. `fallback: none` leaves it empty, `require: true` fails the preflight instead |
-| **Off until used** | No `stamp note`, no `CHANGELOG.md`, no `changelog:` block: the release runs exactly as it did before, and the check is skipped |
+
+> [!NOTE]
+> The changelog is off until you use it. No `stamp note`, no `CHANGELOG.md`, no `changelog:`
+> block, and a release runs exactly as it did before.
 
 ## How a release runs
 
@@ -244,6 +259,10 @@ the commit, push it, then `stamp retag` deletes the tag on both sides and recrea
 HEAD with the same message, so the release notes rendered into it survive: the fragments
 they came from were deleted by the release that failed.
 
+> [!WARNING]
+> A tag that has already shipped a release must never move. stamp cannot check that for you
+> — it speaks git, not GitHub — so the confirmation states the rule and you answer for it.
+
 ```console
 $ stamp retag
 
@@ -259,10 +278,6 @@ Checks:
   ✓ working tree clean
   ✓ HEAD is on origin
 ```
-
-Whether anything was published under that tag is the one thing stamp cannot check, because
-it speaks git and not GitHub. The confirmation says the rule and you answer it: a tag that
-has already shipped a release must never move.
 
 ## Checks
 
@@ -281,7 +296,8 @@ Reported with `-` rather than failing: a branch with no upstream, the up-to-date
 under `--no-fetch`, which also drops the remote half of the tag check, and the changelog
 check where the changelog is not in use or nothing was noted.
 
-**Tests are not stamp's job.** There is no `checks:` block and no `--check` flag.
+> [!NOTE]
+> **Tests are not stamp's job.** There is no `checks:` block and no `--check` flag.
 
 A failed preflight lists every problem at once, with the fix in the same line:
 
