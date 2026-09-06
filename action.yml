@@ -42,10 +42,10 @@ inputs:
 
 outputs:
   version:
-    description: 'The verified version, without a leading "v". E.g. "0.3.0".'
+    description: 'The verified version, without a leading "v". E.g. "0.4.0".'
     value: ${{ steps.resolve.outputs.version }}
   tag:
-    description: 'The tag that was checked. E.g. "v0.3.0".'
+    description: 'The tag that was checked. E.g. "v0.4.0".'
     value: ${{ steps.resolve.outputs.tag }}
   prerelease:
     description: '"true" when the version carries a semver pre-release part.'

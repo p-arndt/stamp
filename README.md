@@ -584,21 +584,28 @@ That step checks the tag, then hands the rest of the pipeline what it needs:
 
 | Output | What it is |
 | --- | --- |
-| `version` | The verified version without a leading `v`, e.g. `0.3.0`. |
-| `tag` | The tag that was checked, e.g. `v0.3.0`. |
+| `version` | The verified version without a leading `v`, e.g. `0.4.0`. |
+| `tag` | The tag that was checked, e.g. `v0.4.0`. |
 | `prerelease` | `true` when the version carries a semver pre-release part. |
 | `notes-file` | A file holding the notes read out of the annotated tag. |
 
-Inputs are all optional: `tag` (defaults to the ref that triggered the run), `component` for
-a repository versioning more than one thing, `stamp-version` to install a version other than
-the one the action is pinned at, and `github-token`, used only when `stamp-version` is
-`latest` and defaulted to the workflow's own token. It runs on Linux, macOS and Windows runners, downloads
-the pinned release and checks it against the published checksums, and writes nothing into
-your working tree.
+Pin it to a release, or follow the 0.x line:
 
-`@v0.4.0` pins an exact release, which is the safer default and what Dependabot can bump for
-you. A `@v0` tag also exists and is moved onto every new non-pre-release, so it follows the
-0.x line without a bump — at the cost of the version you run changing under you.
+```yaml
+- uses: p-arndt/stamp@v0.4.0    # an exact release, and Dependabot can bump it
+- uses: p-arndt/stamp@v0        # moved onto every new non-pre-release
+```
+
+Pinning is the safer default and what the workflows here do for every third-party action.
+`@v0` trades that for never having to bump: the version you run changes under you, which is
+the point of it and also the cost.
+
+Every input is optional. `tag` defaults to the ref that triggered the run, `component` names
+one in a repository versioning more than one thing, `stamp-version` installs a version other
+than the one the action is pinned at, and `github-token` is used only when `stamp-version`
+is `latest`, defaulting to the workflow's own token. The action runs on Linux, macOS and
+Windows runners, checks the download against the published checksums, and writes nothing
+into your working tree.
 
 **What the check actually is.** `verify` compares *forwards*: it renders the tag from the
 committed version rather than stripping a prefix off the tag, checks every version location,
