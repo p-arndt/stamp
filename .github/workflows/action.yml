@@ -39,11 +39,32 @@ jobs:
         shell: bash
         run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
 
+      # The mirror in .stamp.yml is what makes `@v0` resolve to the right stamp
+      # release, so it gets its own check. Static on purpose: it must hold on the
+      # release commit itself, where the version it names is not downloadable yet.
+      - name: The version baked into action.yml must match VERSION
+        shell: bash
+        env:
+          EXPECTED: ${{ steps.committed.outputs.version }}
+        run: |
+          set -euo pipefail
+          baked="$(sed -n "s/^ *default: '\([0-9][^']*\)'.*/\1/p" action.yml | head -n1)"
+          [ "$baked" = "$EXPECTED" ] || {
+            echo "action.yml bakes stamp-version '$baked', VERSION says '$EXPECTED'" >&2
+            exit 1
+          }
+          echo "action.yml -> $baked"
+
+      # `stamp-version: latest` rather than the baked default: this workflow runs
+      # on the release commit too (the mirror touches action.yml every time), and
+      # there the baked version is a release that has not published its archives
+      # yet. The step above already covers that the baked value is correct.
       - name: Run the action against the committed version's tag
         id: stamp
         uses: ./
         with:
           tag: v${{ steps.committed.outputs.version }}
+          stamp-version: latest
 
       - name: Check the outputs
         shell: bash
@@ -81,6 +102,7 @@ jobs:
         uses: ./
         with:
           tag: v9.9.9
+          stamp-version: latest
 
       - name: Check the mismatch was rejected
         shell: bash
