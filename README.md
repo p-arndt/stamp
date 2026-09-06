@@ -590,8 +590,9 @@ That step checks the tag, then hands the rest of the pipeline what it needs:
 | `notes-file` | A file holding the notes read out of the annotated tag. |
 
 Inputs are all optional: `tag` (defaults to the ref that triggered the run), `component` for
-a repository versioning more than one thing, and `stamp-version` to install a version other
-than the one the action is pinned at. It runs on Linux, macOS and Windows runners, downloads
+a repository versioning more than one thing, `stamp-version` to install a version other than
+the one the action is pinned at, and `github-token`, used only when `stamp-version` is
+`latest` and defaulted to the workflow's own token. It runs on Linux, macOS and Windows runners, downloads
 the pinned release and checks it against the published checksums, and writes nothing into
 your working tree.
 

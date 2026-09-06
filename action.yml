@@ -31,6 +31,14 @@ inputs:
       at. Set it to pin a different one, or to "latest" to look one up.
     required: false
     default: '0.4.0'
+  github-token:
+    description: >-
+      Used for one thing only: looking up the newest release when
+      stamp-version is "latest". The archives themselves are public and are
+      fetched without it. Unauthenticated API calls are rate limited per IP,
+      and runners share those, so the default is the workflow's own token.
+    required: false
+    default: ${{ github.token }}
 
 outputs:
   version:
@@ -62,6 +70,7 @@ runs:
       shell: bash
       env:
         REQUESTED: ${{ inputs.stamp-version }}
+        GH_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
 
@@ -69,22 +78,32 @@ runs:
         if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "latest" ]; then
           version="${REQUESTED#v}"
         else
-          # Only reached when a caller explicitly asks for "latest". The API
-          # needs no token for a public repository, but sending one when present
-          # keeps the rate limit off the shared anonymous pool. Both calls are
-          # spelled out rather than built from an array of flags: macOS runners
-          # default to bash 3.2, where expanding an empty array under `set -u`
-          # is an error.
+          # Only reached when a caller explicitly asks for "latest". An
+          # unauthenticated call is rate limited per IP and hosted runners share
+          # those, which surfaces as a 403 on whichever pool is busiest, so a
+          # token is sent whenever there is one. Both calls are spelled out
+          # rather than built from an array of flags: macOS runners default to
+          # bash 3.2, where expanding an empty array under `set -u` is an error.
           api='https://api.github.com/repos/p-arndt/stamp/releases/latest'
-          if [ -n "${GITHUB_TOKEN:-}" ]; then
-            json="$(curl -fsSL -H 'Accept: application/vnd.github+json' \
-              -H "Authorization: Bearer $GITHUB_TOKEN" "$api")"
+          code=0
+          if [ -n "${GH_TOKEN:-}" ]; then
+            body="$(curl -sSL -w '\n%{http_code}' -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GH_TOKEN" "$api")" || code=$?
           else
-            json="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$api")"
+            body="$(curl -sSL -w '\n%{http_code}' -H 'Accept: application/vnd.github+json' "$api")" || code=$?
           fi
-          tag="$(printf '%s' "$json" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
+
+          # -w appends the status on its own last line, so a rate limit reports
+          # as a rate limit instead of a bare "curl: (22) ... error: 403".
+          status="$(printf '%s' "$body" | tail -n1)"
+          if [ "$code" -ne 0 ] || [ "$status" != "200" ]; then
+            echo "::error::could not look up the latest stamp release (HTTP ${status:-none}); pass an exact stamp-version instead of \"latest\"" >&2
+            exit 1
+          fi
+
+          tag="$(printf '%s' "$body" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
           if [ -z "$tag" ]; then
-            echo "::error::could not resolve the latest stamp release; pin one with the stamp-version input" >&2
+            echo "::error::no tag_name in the response from $api; pass an exact stamp-version instead" >&2
             exit 1
           fi
           version="${tag#v}"
