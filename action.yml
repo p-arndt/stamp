@@ -30,7 +30,7 @@ inputs:
       `@v0.4.0`, `@v0` and `@main` each install exactly the release they point
       at. Set it to pin a different one, or to "latest" to look one up.
     required: false
-    default: '0.3.0'
+    default: '0.4.0'
 
 outputs:
   version:
