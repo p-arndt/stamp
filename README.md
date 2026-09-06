@@ -553,8 +553,9 @@ flowchart LR
     style REMOTE fill:#fdfaff,stroke:#e9d5ff,color:#334155
 ```
 
-The pipeline never decides a version. Its first job is to confirm the tag agrees with the
-committed version:
+The pipeline never decides a version, and it never decides what the release says. Both were
+settled on your machine before the tag existed, so the whole stamp side of a pipeline is one
+step:
 
 ```yaml
 on:
@@ -562,29 +563,59 @@ on:
     tags: ['v*']
 
 jobs:
-  verify:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: curl -fsSL https://raw.githubusercontent.com/p-arndt/stamp/main/install.sh | sh -s -- --bin-dir /usr/local/bin
-      - run: stamp verify --tag "$GITHUB_REF_NAME"
+
+      - uses: p-arndt/stamp@v0.4.0
+        id: stamp
+
+      # ... your build, using ${{ steps.stamp.outputs.version }} ...
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          body_path: ${{ steps.stamp.outputs.notes-file }}
+          prerelease: ${{ steps.stamp.outputs.prerelease }}
+          files: dist/*
 ```
 
-`verify` compares *forwards*: it renders the tag from the committed version rather than
-stripping a prefix off the tag, checks every version location, and identifies the component
-the same way. [release.yml](.github/workflows/release.yml) is a working example.
+That step checks the tag, then hands the rest of the pipeline what it needs:
 
-It also never decides what the release says. The notes were written before the tag existed,
-so publishing is one read:
+| Output | What it is |
+| --- | --- |
+| `version` | The verified version without a leading `v`, e.g. `0.3.0`. |
+| `tag` | The tag that was checked, e.g. `v0.3.0`. |
+| `prerelease` | `true` when the version carries a semver pre-release part. |
+| `notes-file` | A file holding the notes read out of the annotated tag. |
+
+Inputs are all optional: `tag` (defaults to the ref that triggered the run), `component` for
+a repository versioning more than one thing, and `stamp-version` to install a version other
+than the one the action is pinned at. It runs on Linux, macOS and Windows runners, downloads
+the pinned release and checks it against the published checksums, and writes nothing into
+your working tree.
+
+`@v0.4.0` pins an exact release, which is the safer default and what Dependabot can bump for
+you. A `@v0` tag also exists and is moved onto every new non-pre-release, so it follows the
+0.x line without a bump — at the cost of the version you run changing under you.
+
+**What the check actually is.** `verify` compares *forwards*: it renders the tag from the
+committed version rather than stripping a prefix off the tag, checks every version location,
+and identifies the component the same way. A tag that agrees by accident still fails.
+
+**Where the notes come from.** `stamp release` renders the changelog section into the
+annotated tag's message, so the tag already carries them and the pipeline generates nothing.
+A tag with an empty body, an older one, or one from a repository not using the changelog
+still publishes: the notes file then holds a line pointing at the commit history rather than
+leaving an empty release page.
+
+**Without the action.** Nothing above needs it; it is two commands and a `curl`:
 
 ```yaml
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          fetch-tags: true
+      - run: curl -fsSL https://raw.githubusercontent.com/p-arndt/stamp/main/install.sh | sh -s -- --bin-dir /usr/local/bin
+      - run: stamp verify --tag "$GITHUB_REF_NAME"
       - run: git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > RELEASE_NOTES.md
 ```
 
-A tag with an empty body, an older one or one from a repository not using the changelog,
-still publishes; give it a line pointing at the commit history rather than an empty release
-page.
+[release.yml](.github/workflows/release.yml) is a working example of the long form, with a
+cross-compile matrix around it.

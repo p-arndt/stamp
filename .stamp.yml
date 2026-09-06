@@ -1,0 +1,9 @@
+# stamp's own configuration. It exists for one reason: the composite action in
+# this repository has to know which stamp release to install, and the honest
+# answer is "the one this commit is". Mirroring the version into action.yml's
+# input default means every ref carries it — a pinned `@v0.4.0`, the moving
+# `@v0`, and `@main` all resolve to exactly the release they point at, with no
+# API lookup and nothing to guess across a major bump.
+version:
+  - VERSION
+  - action.yml#inputs.stamp-version.default

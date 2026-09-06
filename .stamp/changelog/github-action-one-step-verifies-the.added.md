@@ -1,0 +1,1 @@
+GitHub Action: one step verifies the release tag and hands the pipeline the version, the pre-release flag and the notes from the tag. Pin it as `p-arndt/stamp@v0.4.0`, or follow the 0.x line with `@v0`.

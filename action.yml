@@ -1,0 +1,256 @@
+name: 'stamp'
+description: >-
+  Validate a release tag against the version committed in the repository, and
+  hand the pipeline the version, the pre-release flag and the release notes
+  that were written before the tag existed.
+author: 'p-arndt'
+
+branding:
+  icon: 'tag'
+  color: 'blue'
+
+inputs:
+  tag:
+    description: >-
+      The tag to check. Defaults to the ref the workflow was triggered by,
+      which is what a `on: push: tags:` run wants.
+    required: false
+    default: ${{ github.ref_name }}
+  component:
+    description: >-
+      Component to check, for a repository versioning more than one thing.
+      Leave empty and stamp works it out from the tag, which is all a CI job
+      normally knows.
+    required: false
+    default: ''
+  stamp-version:
+    description: >-
+      Version of stamp to install. The default is the version of the ref this
+      action was taken from, kept in step by stamp itself (see .stamp.yml), so
+      `@v0.4.0`, `@v0` and `@main` each install exactly the release they point
+      at. Set it to pin a different one, or to "latest" to look one up.
+    required: false
+    default: '0.3.0'
+
+outputs:
+  version:
+    description: 'The verified version, without a leading "v". E.g. "0.3.0".'
+    value: ${{ steps.resolve.outputs.version }}
+  tag:
+    description: 'The tag that was checked. E.g. "v0.3.0".'
+    value: ${{ steps.resolve.outputs.tag }}
+  prerelease:
+    description: '"true" when the version carries a semver pre-release part.'
+    value: ${{ steps.resolve.outputs.prerelease }}
+  notes-file:
+    description: >-
+      Path to a file holding the release notes read out of the annotated tag.
+      Written outside the workspace, so it never dirties the working tree.
+      Feed it straight to a release action's `body_path`.
+    value: ${{ steps.notes.outputs.notes-file }}
+
+runs:
+  using: composite
+  steps:
+    # The default carries the version of the ref this action came from, because
+    # stamp mirrors it into the input above on every release. That is what makes
+    # the moving `@v0` tag safe: it points at a release commit, and the file at
+    # that commit names that release. `github.action_ref` is deliberately not
+    # consulted — it reads "v0" for the moving tag, which names no version.
+    - name: Resolve the stamp version to install
+      id: which
+      shell: bash
+      env:
+        REQUESTED: ${{ inputs.stamp-version }}
+      run: |
+        set -euo pipefail
+
+        version=""
+        if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "latest" ]; then
+          version="${REQUESTED#v}"
+        else
+          # Only reached when a caller explicitly asks for "latest". The API
+          # needs no token for a public repository, but sending one when present
+          # keeps the rate limit off the shared anonymous pool. Both calls are
+          # spelled out rather than built from an array of flags: macOS runners
+          # default to bash 3.2, where expanding an empty array under `set -u`
+          # is an error.
+          api='https://api.github.com/repos/p-arndt/stamp/releases/latest'
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            json="$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GITHUB_TOKEN" "$api")"
+          else
+            json="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$api")"
+          fi
+          tag="$(printf '%s' "$json" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
+          if [ -z "$tag" ]; then
+            echo "::error::could not resolve the latest stamp release; pin one with the stamp-version input" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+        fi
+
+        if ! [[ "$version" =~ ^[0-9][0-9A-Za-z.+-]{0,63}$ ]]; then
+          echo "::error::'$version' is not a valid stamp version" >&2
+          exit 1
+        fi
+
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    # Downloaded and checked against the published checksums rather than piped
+    # from install.sh into a shell: this action runs inside other people's
+    # pipelines, so the bytes that end up on the runner are verified the same
+    # way the workflows here pin their actions to SHAs.
+    - name: Install stamp
+      shell: bash
+      env:
+        STAMP_VERSION: ${{ steps.which.outputs.version }}
+      run: |
+        set -euo pipefail
+
+        case "$RUNNER_OS" in
+          Linux)   goos=linux  ;;
+          macOS)   goos=darwin ;;
+          Windows) goos=windows ;;
+          *) echo "::error::unsupported runner OS '$RUNNER_OS'" >&2; exit 1 ;;
+        esac
+        case "$RUNNER_ARCH" in
+          X64)   goarch=amd64 ;;
+          ARM64) goarch=arm64 ;;
+          *) echo "::error::unsupported runner architecture '$RUNNER_ARCH'" >&2; exit 1 ;;
+        esac
+
+        ext="tar.gz"
+        bin="stamp"
+        if [ "$goos" = "windows" ]; then ext="zip"; bin="stamp.exe"; fi
+
+        archive="stamp_${STAMP_VERSION}_${goos}_${goarch}.${ext}"
+        sums="stamp_${STAMP_VERSION}_checksums.txt"
+        base="https://github.com/p-arndt/stamp/releases/download/v${STAMP_VERSION}"
+
+        # RUNNER_TEMP is a native path (D:\a\_temp on Windows); normalise it so
+        # the rest of this runs as plain POSIX under MSYS bash too.
+        temp="$RUNNER_TEMP"
+        if command -v cygpath >/dev/null 2>&1; then temp="$(cygpath -u "$RUNNER_TEMP")"; fi
+
+        work="$temp/stamp-download"
+        rm -rf "$work" && mkdir -p "$work"
+        curl -fsSL --retry 3 --retry-delay 2 -o "$work/$archive" "$base/$archive"
+        curl -fsSL --retry 3 --retry-delay 2 -o "$work/$sums"    "$base/$sums"
+
+        # Reduce the checksum file to this one archive: `sha256sum -c` on the
+        # whole file would fail on the five archives that were not downloaded.
+        line="$(grep -E "[[:space:]]\*?${archive}\$" "$work/$sums" || true)"
+        if [ -z "$line" ]; then
+          echo "::error::$archive is not listed in $sums" >&2
+          exit 1
+        fi
+        printf '%s\n' "$line" > "$work/expected.txt"
+
+        if command -v sha256sum >/dev/null 2>&1; then
+          (cd "$work" && sha256sum -c expected.txt)
+        elif command -v shasum >/dev/null 2>&1; then
+          (cd "$work" && shasum -a 256 -c expected.txt)
+        else
+          echo "::error::neither sha256sum nor shasum is available to verify the download" >&2
+          exit 1
+        fi
+
+        dest="$temp/stamp-bin"
+        rm -rf "$dest" && mkdir -p "$dest"
+        if [ "$ext" = "zip" ]; then
+          # Windows runners ship PowerShell but not necessarily unzip. Expand-Archive
+          # is a native command, so it needs the paths back in native form.
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q -o "$work/$archive" -d "$dest"
+          else
+            pwsh -NoLogo -NoProfile -Command \
+              "Expand-Archive -LiteralPath '$(cygpath -w "$work/$archive")' -DestinationPath '$(cygpath -w "$dest")' -Force"
+          fi
+        else
+          tar -xzf "$work/$archive" -C "$dest"
+          chmod +x "$dest/$bin"
+        fi
+
+        rm -rf "$work"
+
+        # GITHUB_PATH is read by the runner, not by bash: it wants the native path.
+        if command -v cygpath >/dev/null 2>&1; then
+          cygpath -w "$dest" >> "$GITHUB_PATH"
+        else
+          echo "$dest" >> "$GITHUB_PATH"
+        fi
+        "$dest/$bin" version
+
+    # The check this whole action exists for. `verify` compares forwards: it
+    # renders the tag from the committed version rather than stripping a prefix
+    # off the tag, so a tag that agrees by accident still fails.
+    - name: Verify the tag against the committed version
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+        COMPONENT: ${{ inputs.component }}
+      run: |
+        set -euo pipefail
+        if [ -n "$COMPONENT" ]; then
+          stamp verify "$COMPONENT" --tag "$TAG"
+        else
+          stamp verify --tag "$TAG"
+        fi
+
+    - name: Resolve the version
+      id: resolve
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+
+        version="${TAG#v}"
+        # Bounded, semver-ish charset: keeps the version safe to splice into
+        # archive names downstream.
+        if ! [[ "$version" =~ ^[0-9][0-9A-Za-z.+-]{0,63}$ ]]; then
+          echo "::error::version '$version' is not a valid release version" >&2
+          exit 1
+        fi
+        # Semver pre-release tags (e.g. v0.2.0-beta.1) are flagged automatically.
+        if [[ "$version" == *-* ]]; then prerelease=true; else prerelease=false; fi
+
+        {
+          echo "tag=$TAG"
+          echo "version=$version"
+          echo "prerelease=$prerelease"
+        } >> "$GITHUB_OUTPUT"
+
+    # The notes were written by a human before the tag existed: `stamp release`
+    # renders the changelog section into the annotated tag's message, so the tag
+    # already carries them. Nothing is generated here, it is one read.
+    - name: Read the release notes out of the tag
+      id: notes
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+
+        file="$RUNNER_TEMP/stamp-release-notes.md"
+
+        # A shallow checkout has the tag the run was triggered by but not its
+        # object; fetch it rather than silently publishing the fallback.
+        if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+          git fetch --no-tags --depth 1 origin "+refs/tags/$TAG:refs/tags/$TAG" >/dev/null 2>&1 || true
+        fi
+
+        body="$(git tag -l --format='%(contents:body)' "$TAG" 2>/dev/null || true)"
+
+        # A lightweight tag, an older tag, or a repository not using the
+        # changelog has no body. Point at the history rather than publishing an
+        # empty release page.
+        if [ -n "${body//[[:space:]]/}" ]; then
+          printf '%s\n' "$body" > "$file"
+        else
+          printf 'See the [commit history](%s/commits/%s) for what changed.\n' \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$TAG" > "$file"
+        fi
+
+        echo "notes-file=$file" >> "$GITHUB_OUTPUT"

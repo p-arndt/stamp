@@ -1,0 +1,94 @@
+name: Action
+permissions:
+  contents: read
+
+# The composite action ships to other people's pipelines, so it is tested the
+# way they will use it: the real download, the real checksum check, the real
+# `stamp verify`, on every runner OS.
+on:
+  push:
+    branches: [main]
+    paths: ['action.yml', '.github/workflows/action.yml']
+  pull_request:
+    paths: ['action.yml', '.github/workflows/action.yml']
+  # The action installs a published release, so a release that has not happened
+  # yet cannot be covered by a paths filter. Allow a manual run.
+  workflow_dispatch:
+
+concurrency:
+  group: action-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Deliberately a shallow, tagless checkout: that is the default, and the
+      # action is supposed to fetch the tag object it needs by itself.
+      - name: Read the version under test
+        id: committed
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Run the action against the committed version's tag
+        id: stamp
+        uses: ./
+        with:
+          tag: v${{ steps.committed.outputs.version }}
+
+      - name: Check the outputs
+        shell: bash
+        env:
+          EXPECTED: ${{ steps.committed.outputs.version }}
+          VERSION: ${{ steps.stamp.outputs.version }}
+          TAG: ${{ steps.stamp.outputs.tag }}
+          PRERELEASE: ${{ steps.stamp.outputs.prerelease }}
+          NOTES: ${{ steps.stamp.outputs.notes-file }}
+        run: |
+          set -euo pipefail
+          [ "$VERSION" = "$EXPECTED" ]     || { echo "version: got '$VERSION', want '$EXPECTED'" >&2; exit 1; }
+          [ "$TAG" = "v$EXPECTED" ]        || { echo "tag: got '$TAG', want 'v$EXPECTED'" >&2; exit 1; }
+          [ "$PRERELEASE" = "false" ]      || { echo "prerelease: got '$PRERELEASE', want 'false'" >&2; exit 1; }
+          [ -s "$NOTES" ]                  || { echo "notes-file '$NOTES' is missing or empty" >&2; exit 1; }
+          echo "--- notes ---"
+          cat "$NOTES"
+
+      # The working tree must come out of the action clean: the notes go to
+      # RUNNER_TEMP, so a caller that builds from the checkout is unaffected.
+      - name: Check the working tree was not touched
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "the action dirtied the working tree:" >&2
+            git status --porcelain >&2
+            exit 1
+          fi
+
+      # An action that passes on a wrong tag is worse than no action at all.
+      - name: A tag that disagrees with the committed version must fail
+        id: mismatch
+        continue-on-error: true
+        uses: ./
+        with:
+          tag: v9.9.9
+
+      - name: Check the mismatch was rejected
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.mismatch.outcome }}
+        run: |
+          set -euo pipefail
+          [ "$OUTCOME" = "failure" ] || {
+            echo "verify accepted tag v9.9.9 against the committed version" >&2
+            exit 1
+          }

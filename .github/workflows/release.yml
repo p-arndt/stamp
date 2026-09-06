@@ -12,9 +12,13 @@ concurrency:
 # Tag pushes only. The version is decided by `stamp release` before the tag
 # exists, so there is nothing for a manual run to resolve. This pipeline is
 # deliberately a worker, not a controller.
+#
+# 'v*.*.*' rather than 'v*': the moving major tag this workflow pushes at the
+# end is called 'v0', and 'v*' would match it and start a second run whose
+# `stamp verify --tag v0` could only fail.
 on:
   push:
-    tags: ['v*']
+    tags: ['v*.*.*']
 
 jobs:
   # The tag is the only input, and it has to agree with the version committed in
@@ -225,3 +229,41 @@ jobs:
             dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # The composite action in this repository is consumed as `p-arndt/stamp@v0`,
+  # and an action ref is resolved against whatever that tag points at. Moving it
+  # here, last, means it only ever names a version that fully published: if the
+  # build or the release job failed, v0 keeps pointing at the previous good one.
+  #
+  # Pre-releases are skipped on purpose. `@v0` is the "give me the current 0.x"
+  # contract, and a beta is not that.
+  major-tag:
+    needs: [verify, release]
+    if: needs.verify.outputs.PRERELEASE == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Move the major tag onto this release
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+
+          major="v${VERSION%%.*}"
+          echo "moving $major onto $GITHUB_REF_NAME ($GITHUB_SHA)"
+
+          # An annotated tag needs an identity, and naming the bot is honest
+          # about what moved it.
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # -f because the whole point is that this tag already exists and moves.
+          git tag -f -a "$major" -m "stamp $GITHUB_REF_NAME" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$major"
+
+          echo "$major -> $GITHUB_REF_NAME" >> "$GITHUB_STEP_SUMMARY"
