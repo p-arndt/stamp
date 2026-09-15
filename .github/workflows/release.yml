@@ -243,9 +243,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # The workflow's own GITHUB_TOKEN cannot push a ref whose move changes a file
+    # under .github/workflows, and that permission cannot be granted to it. The
+    # tag is pushed with MAJOR_TAG_TOKEN instead: a fine-grained token for this
+    # repository with Contents and Workflows set to read and write.
     steps:
+      - name: Require the major tag token
+        shell: bash
+        env:
+          MAJOR_TAG_TOKEN: ${{ secrets.MAJOR_TAG_TOKEN }}
+        run: |
+          if [ -z "$MAJOR_TAG_TOKEN" ]; then
+            echo "::error::secret MAJOR_TAG_TOKEN is not set: create a fine-grained token for this repository with Contents and Workflows read and write, and add it under Settings > Secrets and variables > Actions" >&2
+            exit 1
+          fi
+
+      # checkout persists the token as the push credential for the step below.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.MAJOR_TAG_TOKEN }}
 
       - name: Move the major tag onto this release
         shell: bash
