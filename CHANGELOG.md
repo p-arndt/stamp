@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.1 - 2026-09-15
+
+### Fixed
+
+- The action publishes the notes from the annotated tag even when `actions/checkout` v5 or earlier replaced it with a lightweight tag, instead of falling back to the commit history link
+- The action's `stamp-version: latest` lookup is authenticated with the workflow token, so it no longer fails with an HTTP 403 on runner pools that share a rate-limited IP.
+
 ## 0.4.0 - 2026-09-06
 
 ### Added
