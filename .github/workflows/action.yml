@@ -117,7 +117,8 @@ jobs:
           NOTES: ${{ steps.lightweight.outputs.notes-file }}
         run: |
           set -euo pipefail
-          if grep -q 'commit history' "$NOTES"; then
+          # The fallback line itself, not the words: notes may mention them.
+          if grep -q '^See the \[commit history\](' "$NOTES"; then
             echo "the action published the fallback instead of the tag's notes:" >&2
             cat "$NOTES" >&2
             exit 1
