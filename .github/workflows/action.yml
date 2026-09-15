@@ -95,6 +95,34 @@ jobs:
             exit 1
           fi
 
+      # Older actions/checkout releases (v5 and earlier) replace the pushed tag
+      # with a lightweight ref to its commit, which carries no message. The
+      # action must still publish the notes, so recreate that state and rerun.
+      - name: Replace the tag with a lightweight one, like an older checkout
+        shell: bash
+        env:
+          TAG: v${{ steps.committed.outputs.version }}
+        run: git tag -f "$TAG" HEAD
+
+      - name: Run the action against the lightweight tag
+        id: lightweight
+        uses: ./
+        with:
+          tag: v${{ steps.committed.outputs.version }}
+          stamp-version: latest
+
+      - name: Check the notes still came from the annotated tag
+        shell: bash
+        env:
+          NOTES: ${{ steps.lightweight.outputs.notes-file }}
+        run: |
+          set -euo pipefail
+          if grep -q 'commit history' "$NOTES"; then
+            echo "the action published the fallback instead of the tag's notes:" >&2
+            cat "$NOTES" >&2
+            exit 1
+          fi
+
       # An action that passes on a wrong tag is worse than no action at all.
       - name: A tag that disagrees with the committed version must fail
         id: mismatch

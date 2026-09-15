@@ -622,6 +622,8 @@ leaving an empty release page.
 ```yaml
       - run: curl -fsSL https://raw.githubusercontent.com/p-arndt/stamp/main/install.sh | sh -s -- --bin-dir /usr/local/bin
       - run: stamp verify --tag "$GITHUB_REF_NAME"
+      # actions/checkout v5 and earlier replace the tag with a lightweight one, without its message
+      - run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
       - run: git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > RELEASE_NOTES.md
 ```
 

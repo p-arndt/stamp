@@ -254,10 +254,15 @@ runs:
 
         file="$RUNNER_TEMP/stamp-release-notes.md"
 
-        # A shallow checkout has the tag the run was triggered by but not its
-        # object; fetch it rather than silently publishing the fallback.
-        if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
-          git fetch --no-tags --depth 1 origin "+refs/tags/$TAG:refs/tags/$TAG" >/dev/null 2>&1 || true
+        # The message lives on the annotated tag object, so that is what has to
+        # be here. A shallow checkout may not have the tag at all, and older
+        # actions/checkout releases (v5 and earlier) replace the pushed tag with
+        # a lightweight ref to its commit. Either way, fetch the real one rather
+        # than silently publishing the fallback.
+        if [ "$(git cat-file -t "refs/tags/$TAG" 2>/dev/null || true)" != "tag" ]; then
+          depth=""
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then depth="--depth=1"; fi
+          git fetch --no-tags $depth origin "+refs/tags/$TAG:refs/tags/$TAG" >/dev/null 2>&1 || true
         fi
 
         body="$(git tag -l --format='%(contents:body)' "$TAG" 2>/dev/null || true)"
