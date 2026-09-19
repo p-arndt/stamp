@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.0 - 2026-09-19
+
+### Added
+
+- `hooks.after_write` in .stamp.yml runs commands such as `cargo update --workspace` after `set`, `release` and `prerelease` write the version, and the release commit includes the tracked files they change
+
 ## 0.4.1 - 2026-09-15
 
 ### Fixed
