@@ -75,6 +75,42 @@ func (r *Repo) HasChanges(paths ...string) (bool, error) {
 	return out != "", nil
 }
 
+// ChangedTracked lists the tracked files whose working-tree or index state
+// differs from HEAD, deletions included, as repository-relative paths.
+//
+// --no-renames so a file a hook moved shows up as the deletion and the addition
+// it is, rather than as only the new name.
+func (r *Repo) ChangedTracked() ([]string, error) {
+	out, err := r.git("diff", "--name-only", "--no-renames", "-z", "HEAD", "--")
+	return splitNUL(out), err
+}
+
+// Untracked lists the untracked files git does not ignore.
+func (r *Repo) Untracked() ([]string, error) {
+	out, err := r.git("ls-files", "--others", "--exclude-standard", "-z")
+	return splitNUL(out), err
+}
+
+// splitNUL splits -z output. -z is used wherever paths come back, because
+// without it git quotes any path holding a non-ASCII byte.
+func splitNUL(out string) []string {
+	var paths []string
+	for _, p := range strings.Split(out, "\x00") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
+
+// RestoreFromHEAD puts paths back, in the index and the working tree, as HEAD
+// has them. It is for rollback only, and only ever given paths that were clean
+// when the release started.
+func (r *Repo) RestoreFromHEAD(paths ...string) error {
+	_, err := r.git(append([]string{"checkout", "HEAD", "--"}, paths...)...)
+	return err
+}
+
 // TagExists reports whether tag exists locally.
 func (r *Repo) TagExists(tag string) (bool, error) {
 	// --verify with a full refname avoids matching a branch of the same name.

@@ -1,0 +1,1 @@
+`hooks.after_write` in .stamp.yml runs commands such as `cargo update --workspace` after `set`, `release` and `prerelease` write the version, and the release commit includes the tracked files they change

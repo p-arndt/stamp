@@ -18,6 +18,7 @@ import (
 	"github.com/p-arndt/stamp/internal/changelog"
 	"github.com/p-arndt/stamp/internal/config"
 	"github.com/p-arndt/stamp/internal/gitx"
+	"github.com/p-arndt/stamp/internal/hook"
 	"github.com/p-arndt/stamp/internal/ui"
 	"github.com/p-arndt/stamp/internal/version"
 )
@@ -438,6 +439,12 @@ func (p *Plan) Print() {
 			ui.Item(p.Comp.Changelog.File)
 		}
 	}
+	if p.runsHooks() {
+		ui.Section("Hooks after writing (their changes to tracked files are committed):")
+		for _, cmd := range p.Comp.AfterWrite {
+			ui.Item("$ " + cmd)
+		}
+	}
 
 	p.printNotes()
 
@@ -513,15 +520,30 @@ type snapshot struct {
 // Run executes the plan. It assumes Print and the confirmation already happened.
 func (p *Plan) Run() error {
 	var written []snapshot
+	hooksRan := false
 
 	// restore puts every written file back and reports what it restored. It is
 	// passed to fail, which prints it *after* the reason for the abort, because the
 	// user wants to read why it stopped before what it undid.
 	restore := func() {
-		if len(written) == 0 {
+		var hookChanged []string
+		if hooksRan {
+			hookChanged = p.hookChanges(written)
+		}
+		if len(written) == 0 && len(hookChanged) == 0 {
 			return
 		}
 		ui.Step("Restored:")
+		// What the hooks changed goes back to HEAD. The tree was clean when
+		// the release started, so every tracked change stamp did not make
+		// itself is theirs.
+		for _, path := range hookChanged {
+			if err := p.Repo.RestoreFromHEAD(path); err != nil {
+				ui.Errorf("could not restore %s: %v", path, err)
+				continue
+			}
+			ui.Item(fmt.Sprintf("%s → as in HEAD", path))
+		}
 		for _, s := range written {
 			abs := filepath.Join(p.Repo.Root, s.path)
 			if s.created {
@@ -563,6 +585,28 @@ func (p *Plan) Run() error {
 		return fail(err, restore, notNothing...)
 	}
 
+	// The hooks, once stamp's own writes are done, so they see the release as
+	// it will be committed: `cargo update` reads the new version out of
+	// Cargo.toml. A failing hook stops the release before the commit, and the
+	// restore closure puts back both stamp's files and theirs.
+	var hookPaths []string
+	if p.runsHooks() {
+		untrackedBefore, err := p.Repo.Untracked()
+		if err != nil {
+			return fail(err, restore, notNothing...)
+		}
+		hooksRan = true
+		if err := RunHooks(p.Repo, p.Comp, p.Current, p.Next); err != nil {
+			p.warnUntracked(untrackedBefore)
+			return fail(err, restore, notNothing...)
+		}
+		hookPaths = p.hookChanges(written)
+		for _, path := range hookPaths {
+			ui.Step("  %s changed by a hook", path)
+		}
+		p.warnUntracked(untrackedBefore)
+	}
+
 	// Commit. The version files are staged explicitly, never `commit -a`,
 	// so nothing that appeared in the tree meanwhile can slip into the release
 	// commit.
@@ -575,6 +619,7 @@ func (p *Plan) Run() error {
 		paths = append(paths, p.Comp.Paths()...)
 	}
 	paths = append(paths, changelogPaths...)
+	paths = append(paths, hookPaths...)
 
 	committed := false
 	if len(paths) > 0 {
@@ -637,6 +682,70 @@ func (p *Plan) Run() error {
 		return errAborted
 	}
 	return nil
+}
+
+// runsHooks reports whether this release runs the after_write hooks. They
+// follow the version write: the tag-only first release writes no version file,
+// so it runs none.
+func (p *Plan) runsHooks() bool {
+	return !p.Unchanged && len(p.Comp.AfterWrite) > 0
+}
+
+// RunHooks runs comp's after_write hooks in the repository root, in order,
+// stopping at the first that fails. `stamp set` and the release share it.
+func RunHooks(repo *gitx.Repo, comp *config.Component, previous, next string) error {
+	env := hook.Env{Version: next, Previous: previous, Component: comp.Name}
+	for _, cmd := range comp.AfterWrite {
+		ui.Step("  running %s", cmd)
+		if err := hook.Run(repo.Root, cmd, env); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hookChanges lists the tracked files that differ from HEAD and that stamp did
+// not write itself. The release started from a clean tree, so they are
+// exactly the hooks' work.
+func (p *Plan) hookChanges(written []snapshot) []string {
+	ours := map[string]bool{}
+	for _, s := range written {
+		ours[filepath.ToSlash(s.path)] = true
+	}
+	for _, path := range p.Comp.Paths() {
+		ours[filepath.ToSlash(path)] = true
+	}
+	changed, err := p.Repo.ChangedTracked()
+	if err != nil {
+		ui.Errorf("listing the files the hooks changed: %v", err)
+		return nil
+	}
+	var theirs []string
+	for _, path := range changed {
+		if !ours[path] {
+			theirs = append(theirs, path)
+		}
+	}
+	return theirs
+}
+
+// warnUntracked names the files the hooks created. They are not committed:
+// the tree was clean before the release, so a new file is something no one
+// has looked at yet, and a release commit is no place to find out what it is.
+func (p *Plan) warnUntracked(before []string) {
+	after, err := p.Repo.Untracked()
+	if err != nil {
+		return
+	}
+	existed := map[string]bool{}
+	for _, path := range before {
+		existed[path] = true
+	}
+	for _, path := range after {
+		if !existed[path] {
+			ui.Warnf("a hook created %s; stamp neither commits nor removes untracked files", path)
+		}
+	}
 }
 
 // writeChangelog renders the section into the changelog file and removes the

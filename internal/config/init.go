@@ -324,6 +324,7 @@ func Migrate(root string) (*Draft, error) {
 		commit: comp.CommitTemplate,
 		preID:  comp.PreID,
 		push:   comp.Push,
+		hooks:  comp.AfterWrite,
 	}
 	// A source renders back into exactly the shorthand it was built from, so
 	// the round trip through ParseSpec cannot lose anything.
@@ -355,6 +356,8 @@ type draft struct {
 	commit string
 	preID  string
 	push   bool
+	// hooks are carried over by migrate; init never writes any.
+	hooks []string
 }
 
 // render writes the YAML by hand rather than marshalling a struct. A marshalled
@@ -386,6 +389,14 @@ func (d draft) render() string {
 	setting(&b, "commit", d.commit, "")
 	setting(&b, "push", fmt.Sprintf("%t", d.push), "false stops after the local tag")
 	setting(&b, "prerelease", d.preID, "the series `stamp prerelease` opens")
+
+	if len(d.hooks) > 0 {
+		b.WriteString("\n# Run after the version files are written; what they change is committed.\n")
+		b.WriteString("hooks:\n  after_write:\n")
+		for _, cmd := range d.hooks {
+			fmt.Fprintf(&b, "    - %s\n", yamlValue(cmd))
+		}
+	}
 
 	if multi {
 		b.WriteString("\n# Each component is versioned, tagged and released on its own:\n")

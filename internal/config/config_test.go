@@ -553,3 +553,100 @@ func TestChangelogEnabled(t *testing.T) {
 		}
 	})
 }
+
+func TestHooks(t *testing.T) {
+	dir := t.TempDir()
+	cfg := load(t, dir, `
+version: VERSION
+hooks:
+  after_write:
+    - cargo update --workspace
+    - "echo done"
+`)
+	got := strings.Join(cfg.Only().AfterWrite, "|")
+	if got != "cargo update --workspace|echo done" {
+		t.Errorf("after_write = %q", got)
+	}
+
+	// A single command may be written without the list.
+	cfg = load(t, dir, "version: VERSION\nhooks:\n  after_write: make lock\n")
+	if got := strings.Join(cfg.Only().AfterWrite, "|"); got != "make lock" {
+		t.Errorf("scalar after_write = %q", got)
+	}
+
+	// Without the block there are no hooks.
+	cfg = load(t, dir, "version: VERSION\n")
+	if len(cfg.Only().AfterWrite) != 0 {
+		t.Errorf("after_write = %q, want none", cfg.Only().AfterWrite)
+	}
+}
+
+// A component inherits the top-level hooks, and naming its own replaces them;
+// an empty list is how one component opts out.
+func TestHooksComponentOverride(t *testing.T) {
+	dir := t.TempDir()
+	cfg := load(t, dir, `
+hooks:
+  after_write: [cargo update --workspace]
+release:
+  tag: "{{component}}-v{{version}}"
+components:
+  core:
+    version: Cargo.toml#workspace.package.version
+  web:
+    version: web/package.json#version
+    hooks:
+      after_write: [npm install --package-lock-only]
+  docs:
+    version: docs/VERSION
+    hooks:
+      after_write: []
+`)
+	for name, want := range map[string]string{
+		"core": "cargo update --workspace",
+		"web":  "npm install --package-lock-only",
+		"docs": "",
+	} {
+		if got := strings.Join(cfg.Lookup(name).AfterWrite, "|"); got != want {
+			t.Errorf("%s after_write = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestHooksRejects(t *testing.T) {
+	tests := []struct{ name, yaml, want string }{
+		{"unknown hooks key", "version: VERSION\nhooks:\n  before_write: [x]\n", "unknown key"},
+		{"hooks that are not a mapping", "version: VERSION\nhooks: [cargo update]\n", "must be a mapping"},
+		{"a mapping as the list", "version: VERSION\nhooks:\n  after_write:\n    run: x\n", "must be a list of shell commands"},
+		{"a number as a command", "version: VERSION\nhooks:\n  after_write: [42]\n", "must be a shell command string"},
+		{"a boolean as a command", "version: VERSION\nhooks:\n  after_write: [true]\n", "must be a shell command string"},
+		{"a nested list", "version: VERSION\nhooks:\n  after_write:\n    - [a, b]\n", "must be a shell command string"},
+		{"a mapping as a command", "version: VERSION\nhooks:\n  after_write:\n    - run: x\n", "must be a shell command string"},
+		{"an empty command", "version: VERSION\nhooks:\n  after_write: [\"  \"]\n", "is empty"},
+		{"unknown component hooks key", "components:\n  a:\n    version: VERSION\n    hooks:\n      after: [x]\n", "unknown key"},
+	}
+	for _, tc := range tests {
+		dir := t.TempDir()
+		err := loadErr(t, dir, tc.yaml)
+		if err == nil {
+			t.Errorf("%s: was accepted, want an error", tc.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want it to mention %q", tc.name, err, tc.want)
+		}
+	}
+}
+
+// migrate rewrites the version shape and must not drop the hooks on the way.
+func TestMigrateKeepsHooks(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, FileName, "version:\n  source: VERSION\nhooks:\n  after_write: [\"cargo update --workspace\"]\n")
+	draft, err := Migrate(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(draft.Config.Only().AfterWrite, "|"); got != "cargo update --workspace" {
+		t.Errorf("after migrate, after_write = %q\n%s", got, draft.YAML)
+	}
+}

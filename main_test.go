@@ -1621,3 +1621,140 @@ func TestPlanTruncatesALongChangelog(t *testing.T) {
 		t.Errorf("the plan printed more than ten entries:\n%s", out)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// hooks
+// ---------------------------------------------------------------------------
+
+// hookRepo is a repository at 0.4.0 whose .stamp.yml runs hooks, with a
+// tracked lock.txt standing in for Cargo.lock. The hooks are sh command lines,
+// so these tests skip on Windows, where they would run under pwsh or cmd.
+func hookRepo(t *testing.T, hooks ...string) *repo {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the hook commands in these tests are sh")
+	}
+	r := newRepo(t)
+	var cfg strings.Builder
+	cfg.WriteString("version: VERSION\nhooks:\n  after_write:\n")
+	for _, h := range hooks {
+		fmt.Fprintf(&cfg, "    - %q\n", h)
+	}
+	r.write(".stamp.yml", cfg.String())
+	r.write("lock.txt", "0.4.0\n")
+	r.seed("0.4.0")
+	return r
+}
+
+// writeLock is the stand-in for `cargo update --workspace`: it rewrites the
+// tracked lock file from the version stamp hands the hook.
+const writeLock = `printf '%s\n' "$STAMP_VERSION" > lock.txt`
+
+func TestSetRunsHooks(t *testing.T) {
+	r := hookRepo(t, writeLock, `printf '%s' "$STAMP_PREVIOUS_VERSION" > previous.txt`)
+	head := r.git("rev-parse", "HEAD")
+
+	out := r.mustStamp("set", "minor")
+	requireContains(t, out, "running "+writeLock)
+	if got := r.read("lock.txt"); got != "0.5.0\n" {
+		t.Errorf("lock.txt = %q, the hook did not run after the write", got)
+	}
+	if got := r.read("previous.txt"); got != "0.4.0" {
+		t.Errorf("STAMP_PREVIOUS_VERSION = %q", got)
+	}
+	if r.git("rev-parse", "HEAD") != head {
+		t.Error("set created a commit")
+	}
+}
+
+func TestSetReportsAFailingHook(t *testing.T) {
+	r := hookRepo(t, "exit 3")
+	out, code := r.stamp("set", "minor")
+	if code == 0 {
+		t.Fatalf("a failing hook must fail set:\n%s", out)
+	}
+	requireContains(t, out, "hook `exit 3` failed", "the version files hold 0.5.0")
+}
+
+// The point of hooks: what they change is part of the release, in the one
+// commit, and the changelog still lands in the file and the tag.
+func TestReleaseCommitsWhatHooksChange(t *testing.T) {
+	r := hookRepo(t, writeLock, "touch stray.txt")
+	r.note("lock", "added", "The lock file follows the version")
+	r.commitAll("notes")
+	r.push()
+
+	out := r.mustStamp("release", "minor", "--yes")
+	requireContains(t, out, "Hooks after writing", "running "+writeLock,
+		"lock.txt changed by a hook", "a hook created stray.txt", "Done")
+
+	if got := r.read("lock.txt"); got != "0.5.0\n" {
+		t.Errorf("lock.txt = %q", got)
+	}
+	files := strings.Fields(r.git("show", "--name-only", "--pretty=format:", "HEAD"))
+	want := []string{".stamp/changelog/lock.added.md", "CHANGELOG.md", "VERSION", "lock.txt"}
+	if strings.Join(files, " ") != strings.Join(want, " ") {
+		t.Errorf("release commit holds %v, want %v", files, want)
+	}
+	requireContains(t, r.read("CHANGELOG.md"), "- The lock file follows the version")
+	requireContains(t, r.tagBody("v0.5.0"), "### Added", "- The lock file follows the version")
+
+	// The untracked file the hook made is left alone, and is all that is left.
+	if status := r.git("status", "--porcelain"); status != "?? stray.txt" {
+		t.Errorf("status after the release = %q, want only the untracked stray.txt", status)
+	}
+	if !strings.Contains(r.remoteGit("tag", "--list"), "v0.5.0") {
+		t.Error("the tag did not reach the remote")
+	}
+}
+
+func TestPrereleaseRunsHooks(t *testing.T) {
+	r := hookRepo(t, writeLock)
+	r.mustStamp("prerelease", "minor", "--yes", "--no-push")
+	if got := r.read("lock.txt"); got != "0.5.0-beta.1\n" {
+		t.Errorf("lock.txt = %q", got)
+	}
+	if files := r.git("show", "--name-only", "--pretty=format:", "HEAD"); strings.Join(strings.Fields(files), " ") != "VERSION lock.txt" {
+		t.Errorf("release commit holds %q", files)
+	}
+}
+
+// A failing hook stops the release before the commit, and everything written,
+// by stamp and by the hooks before it, goes back.
+func TestFailingHookAbortsBeforeCommit(t *testing.T) {
+	r := hookRepo(t, writeLock, "exit 3")
+	head := r.git("rev-parse", "HEAD")
+
+	out, code := r.stamp("release", "minor", "--yes")
+	if code == 0 {
+		t.Fatalf("expected the release to fail:\n%s", out)
+	}
+	requireContains(t, out, "hook `exit 3` failed", "Release aborted", "Restored:",
+		"lock.txt → as in HEAD", "VERSION → 0.4.0", "No commit created.", "No tag created.")
+
+	if got := r.read("VERSION"); got != "0.4.0\n" {
+		t.Errorf("VERSION = %q, want it restored", got)
+	}
+	if got := r.read("lock.txt"); got != "0.4.0\n" {
+		t.Errorf("lock.txt = %q, want it restored", got)
+	}
+	if r.git("rev-parse", "HEAD") != head {
+		t.Error("a commit was left behind")
+	}
+	if r.git("tag", "--list") != "" {
+		t.Error("a tag was left behind")
+	}
+	if status := r.git("status", "--porcelain"); status != "" {
+		t.Errorf("the tree is dirty after the abort:\n%s", status)
+	}
+}
+
+func TestDryRunListsHooksWithoutRunning(t *testing.T) {
+	r := hookRepo(t, "touch ran.txt")
+
+	out := r.mustStamp("release", "minor", "--dry-run")
+	requireContains(t, out, "Hooks after writing", "$ touch ran.txt", "Dry run")
+	if r.exists("ran.txt") {
+		t.Error("a dry run ran the hook")
+	}
+}

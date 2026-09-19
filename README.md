@@ -134,7 +134,7 @@ A successful command hints on **stderr** when a newer version exists, at most on
 | `stamp init` | Ask a few questions, then write a `.stamp.yml` describing this repository. Optional; stamp works without one. |
 | `stamp release [component] <patch\|minor\|major\|final\|x.y.z>` | The whole release: resolve, check, write, commit, tag, push. `final` promotes a pre-release to the release it was for, dropping the pre-release and bumping nothing. |
 | `stamp prerelease [component] [patch\|minor\|major]` | The same, cut as a pre-release: `1.2.3` → `1.3.0-beta.1`. Bare, it cuts the next candidate of the series already running. Abbreviates to `stamp pre`. |
-| `stamp set [component] <patch\|minor\|major\|final\|x.y.z>` | Write the version files only, no git. May also go backwards. It is the correction command. |
+| `stamp set [component] <patch\|minor\|major\|final\|x.y.z>` | Write the version files and run the [hooks](#hooks), no git. May also go backwards. It is the correction command. |
 | `stamp note [component] <added\|changed\|deprecated\|removed\|fixed\|security> <text>` | Record one user-facing change as a file under `.stamp/changelog`, to be committed with the branch that made it. The next release renders it into the changelog. |
 | `stamp changelog [component]` | Print the entries noted since the last release, rendered as the section a release would write. |
 | `stamp retag [component]` | Move this version's tag onto HEAD, keeping its message. For the release whose pipeline failed and published nothing. `--dry-run`, `--no-push`, `-y`. |
@@ -220,11 +220,12 @@ never conflict over the changelog.
 
 ```mermaid
 flowchart LR
-    START(["stamp release minor"]) --> PF{"Preflight"} --> ASK{"Confirm"} --> WRITE["Write<br/>VERSION + mirrors"] --> CL["Render<br/>CHANGELOG.md"] --> COMMIT["Commit"] --> TAG["Annotated tag<br/>notes in the message"] --> PUSH["One push<br/>branch + tag"] --> CI(["Pipeline runs"])
+    START(["stamp release minor"]) --> PF{"Preflight"} --> ASK{"Confirm"} --> WRITE["Write<br/>VERSION + mirrors"] --> CL["Render<br/>CHANGELOG.md"] --> HOOKS["Run<br/>after_write hooks"] --> COMMIT["Commit"] --> TAG["Annotated tag<br/>notes in the message"] --> PUSH["One push<br/>branch + tag"] --> CI(["Pipeline runs"])
 
     PF -. "a check fails" .-> NOTHING["Nothing written"]
     ASK -. "n" .-> NOTHING
     WRITE -. "fails" .-> UNDO["Rolled back<br/>no commit, no tag"]
+    HOOKS -. "fails" .-> UNDO
     COMMIT -. "fails" .-> UNDO
     TAG -. "fails" .-> KEEP["Valid work kept<br/>continue command printed"]
     PUSH -. "fails" .-> KEEP
@@ -235,7 +236,7 @@ flowchart LR
     classDef bad fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
     classDef warn fill:#fef3c7,stroke:#d97706,color:#78350f
     class START,CI done
-    class WRITE,CL,COMMIT,TAG,PUSH step
+    class WRITE,CL,HOOKS,COMMIT,TAG,PUSH step
     class PF,ASK gate
     class NOTHING,UNDO bad
     class KEEP warn
@@ -247,6 +248,7 @@ resting place:
 | Failed at | What stamp does |
 | --- | --- |
 | Writing a file | Restores every file it had already written. No commit, no tag, nothing pushed. |
+| Running a hook | The same, and the tracked files the hooks changed go back to HEAD. Files a hook created are left, with a warning. |
 | Committing | Unstages, then restores the files. Same clean end state. |
 | Creating the tag | Keeps the commit, which is valid on its own, and prints the tag and push commands to continue with. |
 | Pushing | Rolls nothing back. Commit and tag are valid locally; prints the retry command, and the undo command if you would rather. |
@@ -435,6 +437,10 @@ changelog:
   fallback: commits             # commits | none: what an empty release falls back to
   require: false                # true fails preflight when nothing was noted
   tag_body: true                # render the section into the annotated tag message
+
+hooks:
+  after_write:                  # shell commands run after the version files are written
+    - cargo update --workspace
 ```
 
 A Node project, where `package.json` *is* the source of truth:
@@ -449,6 +455,38 @@ config error.
 
 Every `changelog:` key shown is its default, so the block is only worth writing to turn
 something off: `file: ""` renders into the tag alone, `tag_body: false` leaves the tag bare.
+
+### Hooks
+
+Some files follow the version without holding it in a place stamp can address:
+`Cargo.lock` stores it once per workspace member, `package-lock.json` twice. The tool
+that owns the file keeps it in step, so let it:
+
+```yaml
+hooks:
+  after_write:
+    - cargo update --workspace
+```
+
+`after_write` runs after `stamp set`, `stamp release` and `stamp prerelease` have written
+the version files and the changelog, in order, in the repository root, with the output
+streamed. A release then commits every tracked file the hooks changed together with the
+version bump, in the one release commit. The tree was clean when the release started, so
+there is no guessing about what belongs in it. Files a hook creates are not tracked, so they
+are not committed; stamp names them in a warning and leaves them where they are.
+
+- Each command goes through the platform shell: `sh -c` on unix; on Windows `pwsh
+  -NoProfile -Command` when PowerShell 7 is installed, otherwise `cmd /C`. A config
+  shared across platforms is easiest with commands all three understand.
+- The hook sees `STAMP_VERSION`, `STAMP_PREVIOUS_VERSION` and, in a repository with
+  components, `STAMP_COMPONENT`.
+- A hook that exits non-zero aborts the release before the commit, and the version
+  files, the changelog and whatever the hooks changed go back. `stamp set` has nothing
+  to go back to: it reports the failure and leaves the files written.
+- `--dry-run` lists the hooks in the plan and runs none of them. The first release, whose
+  version files already hold the version, writes none of them and runs none either.
+- A component inherits the top-level `hooks:`; naming its own replaces them, and
+  `after_write: []` switches them off for that component.
 
 ### Coming from an older config
 

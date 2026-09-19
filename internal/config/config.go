@@ -87,6 +87,10 @@ type Component struct {
 	PreID string
 	// Changelog is this component's news-fragment configuration.
 	Changelog Changelog
+	// AfterWrite are shell commands run in the repository root after the
+	// version files are written and before anything is committed. What they
+	// change in tracked files goes into the release commit.
+	AfterWrite []string
 }
 
 // Changelog is where this component's changelog entries are collected and
@@ -250,7 +254,7 @@ func parse(root string, raw []byte) (*Config, error) {
 		return nil, fmt.Errorf("%s is empty, delete it or run `stamp init`", FileName)
 	}
 	top := doc.Content[0]
-	if err := strictKeys(top, "top level", "project", "version", "release", "changelog", "components"); err != nil {
+	if err := strictKeys(top, "top level", "project", "version", "release", "changelog", "hooks", "components"); err != nil {
 		return nil, err
 	}
 
@@ -278,6 +282,13 @@ func parse(root string, raw []byte) (*Config, error) {
 	}
 	if n := field(top, "changelog"); n != nil {
 		spec, err := parseChangelog(n, "changelog")
+		if err != nil {
+			return nil, err
+		}
+		spec.applyTo(base)
+	}
+	if n := field(top, "hooks"); n != nil {
+		spec, err := parseHooks(n, "hooks")
 		if err != nil {
 			return nil, err
 		}
@@ -587,6 +598,74 @@ func (s changelogSpec) applyTo(c *Component) {
 	}
 }
 
+// hooksSpec is the `hooks:` mapping, at the top level or inside a component.
+// A nil list means "not written", so a component inherits the top-level hooks
+// unless it names its own; an empty list written out switches them off.
+type hooksSpec struct {
+	AfterWrite []string
+	written    bool
+}
+
+// hookKeys are the keys `hooks:` accepts.
+var hookKeys = []string{"after_write"}
+
+// parseHooks reads the `hooks:` mapping. Every hook is a command string: a
+// number, a boolean or a nested list is almost certainly a mistake in the YAML
+// rather than a command, so it is rejected instead of being run as one.
+func parseHooks(n *yaml.Node, where string) (hooksSpec, error) {
+	var spec hooksSpec
+	if err := strictKeys(n, where, hookKeys...); err != nil {
+		return spec, err
+	}
+	list := field(n, "after_write")
+	if list == nil {
+		return spec, nil
+	}
+	where += ".after_write"
+	spec.written = true
+	spec.AfterWrite = []string{}
+	switch {
+	case list.Kind == yaml.ScalarNode && list.Tag == "!!null":
+		// `after_write:` with nothing after it: no hooks.
+		return spec, nil
+	case list.Kind == yaml.ScalarNode:
+		cmd, err := hookCommand(list, where)
+		if err != nil {
+			return spec, err
+		}
+		spec.AfterWrite = append(spec.AfterWrite, cmd)
+		return spec, nil
+	case list.Kind != yaml.SequenceNode:
+		return spec, fmt.Errorf("%s:%d: %s must be a list of shell commands", FileName, list.Line, where)
+	}
+	for i, item := range list.Content {
+		cmd, err := hookCommand(item, fmt.Sprintf("%s[%d]", where, i))
+		if err != nil {
+			return spec, err
+		}
+		spec.AfterWrite = append(spec.AfterWrite, cmd)
+	}
+	return spec, nil
+}
+
+// hookCommand reads one hook, which has to be a non-empty string.
+func hookCommand(n *yaml.Node, where string) (string, error) {
+	if n.Kind != yaml.ScalarNode || n.Tag != "!!str" {
+		return "", fmt.Errorf("%s:%d: %s must be a shell command string, e.g. %q; quote it if it is meant as one",
+			FileName, n.Line, where, "cargo update --workspace")
+	}
+	if strings.TrimSpace(n.Value) == "" {
+		return "", fmt.Errorf("%s:%d: %s is empty", FileName, n.Line, where)
+	}
+	return n.Value, nil
+}
+
+func (s hooksSpec) applyTo(c *Component) {
+	if s.written {
+		c.AfterWrite = s.AfterWrite
+	}
+}
+
 // parseComponents reads the `components:` mapping, each entry inheriting base.
 func parseComponents(root string, n *yaml.Node, base *Component) ([]*Component, error) {
 	if n.Kind != yaml.MappingNode {
@@ -613,7 +692,7 @@ func parseComponents(root string, n *yaml.Node, base *Component) ([]*Component, 
 		if valNode.Kind != yaml.MappingNode {
 			return nil, fmt.Errorf("%s:%d: %s must be a mapping", FileName, valNode.Line, where)
 		}
-		if err := strictKeys(valNode, where, append([]string{"version", "changelog"}, releaseKeys...)...); err != nil {
+		if err := strictKeys(valNode, where, append([]string{"version", "changelog", "hooks"}, releaseKeys...)...); err != nil {
 			return nil, err
 		}
 
@@ -631,6 +710,13 @@ func parseComponents(root string, n *yaml.Node, base *Component) ([]*Component, 
 				return nil, err
 			}
 			clSpec.applyTo(&comp)
+		}
+		if hn := field(valNode, "hooks"); hn != nil {
+			hSpec, err := parseHooks(hn, where+".hooks")
+			if err != nil {
+				return nil, err
+			}
+			hSpec.applyTo(&comp)
 		}
 
 		versionNode := field(valNode, "version")

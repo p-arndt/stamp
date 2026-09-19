@@ -89,6 +89,12 @@ func Errorf(format string, a ...any) {
 	fmt.Fprintf(Err, "%s %s\n", badStyle.Render("error:"), fmt.Sprintf(format, a...))
 }
 
+// Warnf prints a warning to stderr in stamp's "warning: …" form, for
+// something that did not stop the run but should not go unread.
+func Warnf(format string, a ...any) {
+	fmt.Fprintf(Err, "%s %s\n", warnStyle.Render("warning:"), fmt.Sprintf(format, a...))
+}
+
 // Hint prints an indented follow-up suggestion under an error, usually a
 // command the user can copy.
 func Hint(format string, a ...any) {

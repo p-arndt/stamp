@@ -39,7 +39,7 @@ Usage:
   stamp prerelease [component] [patch|minor|major]
                                               the same, for a pre-release (beta, rc, …)
   stamp set        [component] <patch|minor|major|final|x.y.z>
-                                              write the version files only, no git
+                                              write the version files and run the hooks, no git
   stamp note       [component] <added|changed|deprecated|removed|fixed|security> <text>
                                               record one user-facing change for the changelog
   stamp changelog  [component]                print the entries noted since the last release
@@ -126,6 +126,17 @@ Changelog
 
   It is opt-in by use: a repository that has never run "stamp note", has no
   CHANGELOG.md and declares no changelog: block releases exactly as before.
+
+Hooks
+
+    hooks:
+      after_write:
+        - cargo update --workspace
+
+  run in the repository root after set, release and prerelease write the
+  version files (sh -c on unix; pwsh, else cmd /C, on Windows). A release
+  commits the tracked files they change along with the version bump, and a
+  failing hook aborts it before the commit. --dry-run lists them and runs none.
 
 Pre-releases
 
@@ -748,7 +759,7 @@ func cmdSet(args []string) error {
 		return err
 	}
 
-	cfg, _, err := load()
+	cfg, repo, err := load()
 	if err != nil {
 		return err
 	}
@@ -779,6 +790,13 @@ func cmdSet(args []string) error {
 			return fmt.Errorf("writing %s: %w", src.Path(), err)
 		}
 		ui.Step("%s → %s", src.Describe(), next)
+	}
+	// set has no git and so nothing to roll back to: a failing hook leaves
+	// the version files written, and says so, so the fix is to rerun it.
+	if err := release.RunHooks(repo, comp, current, next); err != nil {
+		ui.Errorf("%v", err)
+		ui.Hint("the version files hold %s; whatever the hook changed before failing is left as it is", next)
+		return errQuiet
 	}
 	return nil
 }
