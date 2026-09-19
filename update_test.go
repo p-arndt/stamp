@@ -25,7 +25,7 @@ import (
 
 // The updater is a library now, so these tests cover the wiring rather than the
 // mechanics: that stamp's configuration finds, verifies and installs a release
-// shaped the way .github/workflows/release.yml builds one.
+// shaped the way the shared go-release workflow (p-arndt/.github) builds one.
 //
 // Three Config fields are the seams: APIBase points at a loopback server,
 // StatePath at a temp cache, ExecutablePath at a throwaway binary, so nothing
@@ -234,7 +234,7 @@ func TestAssetNamesMatchTheReleaseWorkflow(t *testing.T) {
 	lay := &layout.Archive{}
 	lay.SetDefaults(updateRepo)
 
-	// Mirrors the loop in .github/workflows/release.yml: a per-target archive
+	// Mirrors the build loop of the shared go-release workflow: a per-target archive
 	// named stamp_<version>_<goos>_<goarch>, zip on Windows and tar.gz elsewhere.
 	want := map[string]string{
 		"linux/amd64":   "stamp_1.2.0_linux_amd64.tar.gz",

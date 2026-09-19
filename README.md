@@ -627,5 +627,6 @@ leaving an empty release page.
       - run: git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > RELEASE_NOTES.md
 ```
 
-[release.yml](.github/workflows/release.yml) is a working example of the long form, with a
-cross-compile matrix around it.
+[go-release.yml](https://github.com/p-arndt/.github/blob/v1/.github/workflows/go-release.yml)
+in p-arndt/.github is a working example of the whole pipeline around it, cross-compile included;
+this repository's [release.yml](.github/workflows/release.yml) calls it.
